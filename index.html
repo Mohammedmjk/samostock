@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ar" dir="rtl" class="w-full max-w-full overflow-x-hidden">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>مذخر سامو</title>
+    <meta name="description" content="نظام مذخر سامو لإدارة وتوزيع الأدوية والمستلزمات الطبية للصيدليات، مع روابط طلب مخصصة، وبحث فوري، وتجهيز وتصدير وطباعة قوائم الطلبيات." />
+    <meta property="og:title" content="مذخر سامو" />
+    <meta property="og:description" content="نظام مذخر سامو لإدارة وتوزيع الأدوية والمستلزمات الطبية للصيدليات، مع روابط طلب مخصصة، وبحث فوري، وتجهيز وتصدير وطباعة قوائم الطلبيات." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#2563eb" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="مذخر سامو" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800;900&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+  </head>
+  <body class="bg-slate-50 text-slate-900 antialiased selection:bg-blue-600 selection:text-white w-full max-w-full overflow-x-hidden">
+    <div id="root">
+      <div style="min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background-color: #0f172a; font-family: 'Cairo', system-ui, sans-serif; color: #f8fafc; direction: rtl;">
+        <div style="position: relative; width: 64px; height: 64px; margin-bottom: 20px;">
+          <div style="box-sizing: border-box; width: 64px; height: 64px; border: 4px solid rgba(59, 130, 246, 0.2); border-top-color: #3b82f6; border-radius: 50%; animation: samo-spin 0.8s linear infinite;"></div>
+        </div>
+        <h2 style="font-size: 20px; font-weight: 800; margin: 0 0 8px 0; color: #ffffff; letter-spacing: -0.5px;">مذخر سامو</h2>
+        <p style="font-size: 13px; color: #94a3b8; margin: 0;">جاري تحميل نظام الإدارة والمخزون...</p>
+        <style>
+          @keyframes samo-spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+          }
+        </style>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

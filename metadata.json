@@ -1,0 +1,6 @@
+{
+  "name": "مذخر سامو",
+  "description": "نظام مذخر سامو لإدارة وتوزيع الأدوية والمستلزمات الطبية للصيدليات، مع روابط طلب مخصصة، وبحث فوري، وتجهيز وتصدير وطباعة قوائم الطلبيات.",
+  "requestFramePermissions": ["camera", "notifications"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
