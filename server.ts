@@ -2313,16 +2313,11 @@ app.post('/api/auth/delete', (req, res) => {
 });
 
 async function start() {
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = fs.existsSync(path.join(process.cwd(), 'dist', 'index.html'))
-      ? path.join(process.cwd(), 'dist')
-      : (fs.existsSync(path.join(process.cwd(), 'build', 'index.html')) ? path.join(process.cwd(), 'build') : path.join(process.cwd(), 'dist'));
+  const port = Number(process.env.PORT) || 3000;
+  const distPath = path.join(process.cwd(), 'dist');
+
+  // تقديم ملفات الإنتاج الجاهزة
+  if (fs.existsSync(distPath)) {
     app.use(express.static(distPath, {
       maxAge: '1h',
       setHeaders: (res, filePath) => {
@@ -2331,14 +2326,22 @@ async function start() {
         }
       }
     }));
+
     app.get('*', (req, res) => {
       res.setHeader('Cache-Control', 'no-cache');
       res.sendFile(path.join(distPath, 'index.html'));
     });
+  } else {
+    // خادم التطوير كخيار بديل محلي فقط في حال عدم وجود dist
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Pharmacy Sales & Warehouse System server running on http://localhost:${PORT}`);
+  app.listen(port, '0.0.0.0', () => {
+    console.log(`Pharmacy Sales & Warehouse System server running on port ${port}`);
   });
 }
 
