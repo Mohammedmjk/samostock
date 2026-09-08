@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { 
   CheckCircle, 
   CheckCircle2,
@@ -36,15 +36,26 @@ import {
   Users,
   PhoneCall,
   Share2,
-  Camera
+  Camera,
+  Edit3,
+  Plus,
+  Minus,
+  PackagePlus,
+  Pill,
 } from 'lucide-react';
-import { Order, OrderStatus, WarehouseSettings } from '../types';
+import { Order, OrderStatus, WarehouseSettings, Product, AppUser, WarehouseOperation } from '../types';
 import { InventoryAlertSummary } from '../services/alertService';
 import { storage } from '../services/storage';
-import { CameraBarcodeScannerModal } from './CameraBarcodeScannerModal';
+import { EditOrderQuantitiesModal } from './EditOrderQuantitiesModal';
+import { DirectPharmacyDispatchModal } from './DirectPharmacyDispatchModal';
+import { ApprovedDispatchedOrdersRegistry } from './ApprovedDispatchedOrdersRegistry';
+import { PreparedDeliveredMaterialsRegistry } from './PreparedDeliveredMaterialsRegistry';
 
 interface WarehouseDashboardProps {
   orders: Order[];
+  registeredUsers?: AppUser[];
+  currentUser?: AppUser | null;
+  operations?: WarehouseOperation[];
   onUpdateOrderStatus: (orderId: string, status: OrderStatus, reason?: string) => void;
   onUpdateOrderVerification: (
     orderId: string, 
@@ -52,7 +63,11 @@ interface WarehouseDashboardProps {
     status?: OrderStatus,
     preparedBy?: string
   ) => void;
+  onUpdateOrder?: (updatedOrder: Order) => void;
+  onAddOrder?: (newOrder: Order) => void;
+  products?: Product[];
   onDeleteOrder: (orderId: string) => void;
+  onDeleteOrdersBulk?: (orderIds: string[]) => void | Promise<void>;
   onDeletePharmacy: (pharmacyName: string, deleteOrders: boolean) => void;
   onOpenShareModalForPharmacy?: (pharmacyName: string) => void;
   settings: WarehouseSettings;
@@ -60,16 +75,24 @@ interface WarehouseDashboardProps {
   onDismissNewOrderAlert: () => void;
   alerts?: InventoryAlertSummary;
   onOpenNotificationCenter?: () => void;
-  onNavigateToInventory?: (filterType: 'out_of_stock' | 'low_stock' | 'near_expiry' | 'expired') => void;
+  onNavigateToInventory?: (filterType: 'all' | 'out_of_stock' | 'low_stock' | 'near_expiry' | 'expired') => void;
   onOpenApprovals?: () => void;
   pendingApprovalsCount?: number;
+  initialTab?: OrderStatus | 'all' | 'pharmacies' | 'approved_dispatched' | 'operations' | 'prepared_materials';
 }
 
 export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
   orders,
+  registeredUsers,
+  currentUser,
+  operations = [],
   onUpdateOrderStatus,
   onUpdateOrderVerification,
+  onUpdateOrder,
+  onAddOrder,
+  products = [],
   onDeleteOrder,
+  onDeleteOrdersBulk,
   onDeletePharmacy,
   onOpenShareModalForPharmacy,
   settings,
@@ -80,14 +103,110 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
   onNavigateToInventory,
   onOpenApprovals,
   pendingApprovalsCount = 0,
+  initialTab,
 }) => {
-  const [activeTab, setActiveTab] = useState<OrderStatus | 'all' | 'pharmacies'>('new');
+  const [activeTab, setActiveTab] = useState<OrderStatus | 'all' | 'pharmacies' | 'approved_dispatched' | 'operations' | 'prepared_materials'>(
+    initialTab || 'new'
+  );
+
+  useEffect(() => {
+    if (initialTab) {
+      setActiveTab(initialTab);
+    }
+  }, [initialTab]);
   const [searchTerm, setSearchTerm] = useState('');
   const [pharmacySearchTerm, setPharmacySearchTerm] = useState('');
   const [selectedOrderForPrep, setSelectedOrderForPrep] = useState<Order | null>(null);
   const [selectedOrderForPrint, setSelectedOrderForPrint] = useState<Order | null>(null);
+  const [orderToEditQuantities, setOrderToEditQuantities] = useState<Order | null>(null);
   const [rejectModalOrder, setRejectModalOrder] = useState<{ order: Order; reason: string } | null>(null);
   const [orderToDelete, setOrderToDelete] = useState<Order | null>(null);
+  const [showDeleteAllPendingModal, setShowDeleteAllPendingModal] = useState(false);
+  const [isDeletingAllPending, setIsDeletingAllPending] = useState(false);
+  const [isDirectDispatchOpen, setIsDirectDispatchOpen] = useState(false);
+  const [directDispatchInitialPharmacy, setDirectDispatchInitialPharmacy] = useState<string | undefined>(undefined);
+
+  // Open Direct Pharmacy Dispatch modal
+  const handleOpenDirectDispatch = (pharmacyName?: string) => {
+    setDirectDispatchInitialPharmacy(pharmacyName);
+    setIsDirectDispatchOpen(true);
+  };
+
+  // Save order created directly by warehouse employee
+  const handleSaveDirectOrder = (newOrder: Order, postAction: 'prep' | 'print' | 'none' = 'none') => {
+    if (onAddOrder) {
+      onAddOrder(newOrder);
+    } else {
+      storage.addOrder(newOrder);
+    }
+
+    if (postAction === 'prep') {
+      handleStartPreparation(newOrder);
+    } else if (postAction === 'print') {
+      setSelectedOrderForPrint(newOrder);
+    }
+  };
+
+  // Save modified order (quantities, bonus, items, totals)
+  const handleSaveOrderQuantities = (updatedOrder: Order) => {
+    if (onUpdateOrder) {
+      onUpdateOrder(updatedOrder);
+    } else {
+      const allOrders = storage.getOrders();
+      const updated = allOrders.map((o) => (o.id === updatedOrder.id ? updatedOrder : o));
+      storage.saveOrders(updated);
+    }
+    // Sync if preparation modal is currently open with this order
+    if (selectedOrderForPrep && selectedOrderForPrep.id === updatedOrder.id) {
+      setSelectedOrderForPrep(updatedOrder);
+    }
+    // Sync if invoice print modal is currently open with this order
+    if (selectedOrderForPrint && selectedOrderForPrint.id === updatedOrder.id) {
+      setSelectedOrderForPrint(updatedOrder);
+    }
+  };
+
+  // Quick single-item stepper adjustment directly from the order items table
+  const handleQuickAdjustItemQuantity = (order: Order, productId: string, delta: number) => {
+    const targetItem = order.items.find((it) => it.productId === productId);
+    if (!targetItem) return;
+    const newQty = Math.max(1, targetItem.quantity + delta);
+    if (newQty === targetItem.quantity) return;
+
+    const updatedItems = order.items.map((it) => {
+      if (it.productId === productId) {
+        const effectivePrice = it.isBonusMelted && it.meltedUnitPrice ? it.meltedUnitPrice : it.unitPrice;
+        let newBonus = it.bonusQuantity;
+        if (it.quantity > 0 && it.bonusQuantity > 0) {
+          const ratio = it.bonusQuantity / it.quantity;
+          newBonus = Math.round(newQty * ratio);
+        }
+        return {
+          ...it,
+          quantity: newQty,
+          bonusQuantity: newBonus,
+          totalPrice: newQty * effectivePrice,
+        };
+      }
+      return it;
+    });
+
+    const newTotalQty = updatedItems.reduce((s, it) => s + it.quantity, 0);
+    const newTotalBonus = updatedItems.reduce((s, it) => s + (it.bonusQuantity || 0), 0);
+    const newTotalAmount = updatedItems.reduce((s, it) => s + it.totalPrice, 0);
+
+    const updatedOrder: Order = {
+      ...order,
+      items: updatedItems,
+      totalQuantity: newTotalQty,
+      totalBonus: newTotalBonus,
+      totalAmount: newTotalAmount,
+      editedAt: new Date().toISOString(),
+      editReason: 'تعديل سريع للكمية من القائمة',
+    };
+
+    handleSaveOrderQuantities(updatedOrder);
+  };
   const [pharmacyToDelete, setPharmacyToDelete] = useState<{
     name: string;
     ordersCount: number;
@@ -107,6 +226,39 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
     setOrderToDelete(null);
   };
 
+  // Handle confirm delete all pending orders
+  const handleConfirmDeleteAllPending = async () => {
+    const pendingOrders = orders.filter((o) => o.status === 'new' || (o.status as string) === 'pending');
+    if (pendingOrders.length === 0) {
+      setShowDeleteAllPendingModal(false);
+      return;
+    }
+    const pendingIds = pendingOrders.map((o) => o.id);
+    setIsDeletingAllPending(true);
+    try {
+      if (onDeleteOrdersBulk) {
+        await onDeleteOrdersBulk(pendingIds);
+      } else {
+        storage.deleteOrders(pendingIds);
+        if (navigator.onLine) {
+          fetch('/api/orders/bulk-delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids: pendingIds }),
+          }).catch(() => {});
+        }
+        pendingIds.forEach((id) => {
+          if (onDeleteOrder) onDeleteOrder(id);
+        });
+      }
+    } catch (err) {
+      console.error('Failed to delete all pending orders:', err);
+    } finally {
+      setIsDeletingAllPending(false);
+      setShowDeleteAllPendingModal(false);
+    }
+  };
+
   // Handle confirm delete pharmacy
   const handleConfirmDeletePharmacy = async () => {
     if (!pharmacyToDelete) return;
@@ -123,6 +275,9 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
   const handleAcceptAndExportOrder = (order: Order) => {
     if (order.status === 'new') {
       onUpdateOrderStatus(order.id, 'preparing');
+    }
+    if (newOrderAlert && newOrderAlert.id === order.id) {
+      onDismissNewOrderAlert();
     }
     setSelectedOrderForPrint(order);
   };
@@ -175,10 +330,10 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
       `الهاتف: ${order.phone}`,
       `العنوان: ${order.address}`,
       `--------------------------`,
-      ...order.items.map((i, idx) => `${idx + 1}. ${i.tradeNameAr} (${i.confirmedExpiry || i.expiryDate}) - الكمية: ${i.quantity} علبة ${i.bonusQuantity > 0 ? `(+ ${i.bonusQuantity} مجاناً)` : ''} - السعر: ${i.totalPrice.toLocaleString()} ${settings.currency}`),
+      ...order.items.map((i, idx) => `${idx + 1}. ${i.tradeNameAr} (${i.confirmedExpiry || i.expiryDate}) - الكمية: ${i.quantity} علبة ${i.bonusQuantity > 0 ? `(+ ${i.bonusQuantity} مجاناً)` : ''} - السعر: ${(i.totalPrice ?? (i.quantity * i.unitPrice) ?? 0).toLocaleString()} ${settings.currency}`),
       `--------------------------`,
       `إجمالي العلب: ${order.totalQuantity} علبة (+ ${order.totalBonus} بونص)`,
-      `المبلغ الصافي المطلوب: ${order.totalAmount.toLocaleString()} ${settings.currency}`,
+      `المبلغ الصافي المطلوب: ${(order.totalAmount ?? 0).toLocaleString()} ${settings.currency}`,
     ];
     navigator.clipboard.writeText(lines.join('\n')).then(() => {
       setCopiedText(true);
@@ -215,6 +370,24 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
   // Pharmacies directory calculation
   const pharmaciesList = useMemo(() => {
     const deleted = storage.getDeletedPharmacies().map(n => n.trim().toLowerCase());
+    
+    // Filter out warehouse management / admin HQ accounts from being listed as client pharmacies
+    const isWarehouseOrStaffHq = (name?: string, role?: string) => {
+      const n = (name || '').trim().toLowerCase();
+      return (
+        role === 'super_admin' ||
+        role === 'founder' ||
+        role === 'staff' ||
+        role === 'warehouse_manager' ||
+        role === 'pharmacist_staff' ||
+        n.includes('الإدارة العامة') ||
+        n.includes('مذخر سامو') ||
+        n.includes('المشرف العام') ||
+        n.includes('كادر مذخر') ||
+        n.includes('فريق عمل المذخر')
+      );
+    };
+
     const map = new Map<string, {
       name: string;
       pharmacistName: string;
@@ -223,11 +396,13 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
       ordersCount: number;
       totalSpent: number;
       lastOrderDate: string;
+      status?: string;
     }>();
 
+    // 1. Collect pharmacies from orders history
     orders.forEach((o) => {
       const name = (o.pharmacyName || '').trim();
-      if (!name) return;
+      if (!name || isWarehouseOrStaffHq(name)) return;
       if (deleted.includes(name.toLowerCase())) return;
 
       const key = name.toLowerCase();
@@ -250,14 +425,102 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
           ordersCount: 1,
           totalSpent: o.totalAmount,
           lastOrderDate: o.createdAt,
+          status: 'approved',
         });
       }
     });
 
+    // 2. Include all registered customer pharmacies (both approved and pending verification)
+    try {
+      const allUsers = (registeredUsers && registeredUsers.length > 0) ? registeredUsers : storage.getRegisteredUsers();
+      const clientPharmacies = allUsers.filter(
+        (u) =>
+          Boolean(u) &&
+          Boolean(u.pharmacyName && u.pharmacyName.trim()) &&
+          !isWarehouseOrStaffHq(u.pharmacyName, u.role) &&
+          u.status !== 'rejected' &&
+          u.status !== 'blocked' &&
+          !storage.isUserDeleted(u.id, u.identifier, u.pharmacyName) &&
+          !deleted.includes(u.pharmacyName!.trim().toLowerCase())
+      );
+
+      clientPharmacies.forEach((u) => {
+        const name = (u.pharmacyName || '').trim();
+        if (!name) return;
+        const key = name.toLowerCase();
+        if (!map.has(key)) {
+          map.set(key, {
+            name: name,
+            pharmacistName: u.pharmacistName || u.name || 'صيدلي معتمد',
+            phone: u.phone || u.identifier || '',
+            address: u.address || '',
+            ordersCount: 0,
+            totalSpent: 0,
+            lastOrderDate: u.createdAt || new Date().toISOString(),
+            status: u.status,
+          });
+        } else {
+          // If already in map from orders, enrich with user profile data if missing
+          const existing = map.get(key)!;
+          if (u.pharmacistName && (!existing.pharmacistName || existing.pharmacistName === 'غير محدد')) {
+            existing.pharmacistName = u.pharmacistName;
+          }
+          if (u.phone && !existing.phone) existing.phone = u.phone;
+          if (u.address && !existing.address) existing.address = u.address;
+        }
+
+        // Include any secondary branches registered under this account
+        if (Array.isArray((u as any).pharmacies)) {
+          (u as any).pharmacies.forEach((b: any) => {
+            const bName = (b.name || '').trim();
+            if (bName && !isWarehouseOrStaffHq(bName) && !deleted.includes(bName.toLowerCase())) {
+              const bKey = bName.toLowerCase();
+              if (!map.has(bKey)) {
+                map.set(bKey, {
+                  name: bName,
+                  pharmacistName: b.pharmacistName || u.pharmacistName || u.name || 'صيدلي معتمد',
+                  phone: b.phone || u.phone || u.identifier || '',
+                  address: b.address || u.address || '',
+                  ordersCount: 0,
+                  totalSpent: 0,
+                  lastOrderDate: b.createdAt || u.createdAt || new Date().toISOString(),
+                  status: u.status,
+                });
+              }
+            }
+          });
+        }
+      });
+    } catch {
+      // safe fallback
+    }
+
+    // 3. Include any branches saved in local branch storage
+    try {
+      const branchList: any[] = JSON.parse(localStorage.getItem('samo_user_pharmacy_branches_v1') || '[]');
+      branchList.forEach((b) => {
+        const bName = (b.name || '').trim();
+        if (bName && !isWarehouseOrStaffHq(bName) && !deleted.includes(bName.toLowerCase())) {
+          const bKey = bName.toLowerCase();
+          if (!map.has(bKey)) {
+            map.set(bKey, {
+              name: bName,
+              pharmacistName: b.pharmacistName || 'صيدلي مسجل',
+              phone: b.phone || '',
+              address: b.address || '',
+              ordersCount: 0,
+              totalSpent: 0,
+              lastOrderDate: b.createdAt || new Date().toISOString(),
+            });
+          }
+        }
+      });
+    } catch {}
+
     return Array.from(map.values()).sort((a, b) => 
       new Date(b.lastOrderDate).getTime() - new Date(a.lastOrderDate).getTime()
     );
-  }, [orders]);
+  }, [orders, registeredUsers]);
 
   const filteredPharmacies = useMemo(() => {
     const term = pharmacySearchTerm.trim().toLowerCase();
@@ -280,13 +543,83 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
     rejected: orders.filter((o) => o.status === 'rejected').length,
   };
 
+  // Count total materials prepared and delivered
+  const preparedMaterialsCount = useMemo(() => {
+    return orders
+      .filter((o) => o.status === 'ready' || o.status === 'delivered' || o.status === 'preparing')
+      .reduce((sum, o) => sum + (o.items?.length || 0), 0);
+  }, [orders]);
+
+  // Operations filter & search state
+  const [operationsSearchTerm, setOperationsSearchTerm] = useState('');
+  const [operationsTypeFilter, setOperationsTypeFilter] = useState<'all' | 'prepared_delivered' | 'created_edited' | 'status_changed'>('all');
+  const [expandedOpIds, setExpandedOpIds] = useState<Set<string>>(new Set());
+
+  const toggleOpExpanded = (opId: string) => {
+    setExpandedOpIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(opId)) {
+        next.delete(opId);
+      } else {
+        next.add(opId);
+      }
+      return next;
+    });
+  };
+
+  // Filter operations based on type and search query
+  const filteredOperations = useMemo(() => {
+    return operations.filter((op) => {
+      // 1. Type filter
+      if (operationsTypeFilter === 'prepared_delivered') {
+        const isPrep =
+          op.type === 'order_prepared' ||
+          op.type === 'order_delivered' ||
+          (op.type === 'status_changed' && (op.targetStatus === 'ready' || op.targetStatus === 'delivered'));
+        if (!isPrep) return false;
+      } else if (operationsTypeFilter === 'created_edited') {
+        const isCreatedEdited = op.type === 'order_created' || op.type === 'order_edited';
+        if (!isCreatedEdited) return false;
+      } else if (operationsTypeFilter === 'status_changed') {
+        if (op.type !== 'status_changed') return false;
+      }
+
+      // 2. Search term
+      if (operationsSearchTerm.trim()) {
+        const query = operationsSearchTerm.toLowerCase().trim();
+        const matchesEmployee = (op.performedBy || '').toLowerCase().includes(query);
+        const matchesPharmacy = (op.pharmacyName || '').toLowerCase().includes(query);
+        const matchesOrder = (op.orderNumber || '').toLowerCase().includes(query);
+        const matchesDetails = (op.details || '').toLowerCase().includes(query);
+
+        // Match items
+        const opItems =
+          op.items && op.items.length > 0
+            ? op.items
+            : orders.find((o) => o.id === op.orderId || o.orderNumber === op.orderNumber)?.items || [];
+        const matchesMedicines = opItems.some(
+          (i) =>
+            i.tradeNameAr.toLowerCase().includes(query) ||
+            (i.tradeNameEn || '').toLowerCase().includes(query) ||
+            (i.batchNumber && i.batchNumber.toLowerCase().includes(query))
+        );
+
+        if (!matchesEmployee && !matchesPharmacy && !matchesOrder && !matchesDetails && !matchesMedicines) {
+          return false;
+        }
+      }
+
+      return true;
+    });
+  }, [operations, operationsTypeFilter, operationsSearchTerm, orders]);
+
   // Open preparation modal
   const handleStartPreparation = (order: Order) => {
     const initialChecklist: typeof itemChecklist = {};
     order.items.forEach((item) => {
       initialChecklist[item.productId] = {
         verified: item.verified ?? false,
-        status: item.status === 'unavailable' ? 'unavailable' : 'available',
+        status: item?.status === 'unavailable' ? 'unavailable' : 'available',
         confirmedBatch: item.confirmedBatch || item.batchNumber,
         confirmedExpiry: item.confirmedExpiry || item.expiryDate,
         notes: item.notes || '',
@@ -294,6 +627,9 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
     });
     setItemChecklist(initialChecklist);
     setSelectedOrderForPrep(order);
+    if (newOrderAlert && newOrderAlert.id === order.id) {
+      onDismissNewOrderAlert();
+    }
   };
 
   // Toggle item verification in preparation modal
@@ -323,7 +659,7 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
   const handleToggleItemStatusDirect = (order: Order, productId: string) => {
     const updatedItems = order.items.map((item) => {
       if (item.productId === productId) {
-        const isCurrentlyUnavailable = item.status === 'unavailable';
+        const isCurrentlyUnavailable = item?.status === 'unavailable';
         const newStatus = isCurrentlyUnavailable ? 'available' : 'unavailable';
         return {
           ...item,
@@ -344,6 +680,9 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
       'rejected',
       rejectModalOrder.reason || 'نعتذر، يتعذر تجهيز الطلبية حالياً نظراً لنفاد بعض المواد'
     );
+    if (newOrderAlert && newOrderAlert.id === rejectModalOrder.order.id) {
+      onDismissNewOrderAlert();
+    }
     setRejectModalOrder(null);
   };
 
@@ -370,7 +709,7 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
       const check = itemChecklist[item.productId];
       return {
         ...item,
-        status: check?.status || item.status || 'available',
+        status: check?.status || item?.status || 'available',
         verified: check ? check.verified : item.verified,
         confirmedBatch: check?.confirmedBatch || item.batchNumber,
         confirmedExpiry: check?.confirmedExpiry || item.expiryDate,
@@ -450,23 +789,36 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
                   إشعار فوري: وصلت طلبية جديدة من {newOrderAlert.pharmacyName}!
                 </p>
                 <p className="text-xs text-rose-100">
-                  رقم الطلب: {newOrderAlert.orderNumber} • إجمالي المواد: {newOrderAlert.items.length} صنف ({newOrderAlert.totalAmount.toLocaleString()} {settings.currency})
+                  رقم الطلب: {newOrderAlert.orderNumber} • إجمالي المواد: {newOrderAlert.items.length} صنف ({(newOrderAlert.totalAmount ?? 0).toLocaleString()} {settings.currency})
                 </p>
               </div>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <button
+                id="btn-alert-accept-order"
                 onClick={() => {
                   handleStartPreparation(newOrderAlert);
                   onDismissNewOrderAlert();
                 }}
-                className="px-3.5 py-1.5 bg-white text-rose-700 hover:bg-rose-50 text-xs font-bold rounded-lg shadow-xs transition"
+                className="px-3 py-1.5 bg-white text-rose-700 hover:bg-rose-50 text-xs font-bold rounded-lg shadow-xs transition flex items-center gap-1.5 cursor-pointer"
               >
-                تجهيز الطلب الآن
+                <CheckCircle className="w-3.5 h-3.5 text-emerald-600" />
+                <span>قبول وبدء التجهيز</span>
+              </button>
+              <button
+                id="btn-alert-reject-order"
+                onClick={() => {
+                  setRejectModalOrder({ order: newOrderAlert, reason: '' });
+                  onDismissNewOrderAlert();
+                }}
+                className="px-3 py-1.5 bg-rose-800 hover:bg-rose-900 text-white text-xs font-bold rounded-lg shadow-xs transition flex items-center gap-1.5 cursor-pointer"
+              >
+                <XCircle className="w-3.5 h-3.5 text-rose-300" />
+                <span>رفض الطلب</span>
               </button>
               <button
                 onClick={onDismissNewOrderAlert}
-                className="text-white/80 hover:text-white text-xs px-2 py-1"
+                className="text-white/80 hover:text-white text-xs px-2 py-1 transition cursor-pointer"
               >
                 إغلاق
               </button>
@@ -482,50 +834,60 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
             <h2 className="text-xl sm:text-2xl font-black text-slate-900">
               لوحة تحكم وتجهيز طلبيات الصيدليات
             </h2>
+            <p className="text-xs text-slate-500 mt-1">
+              متابعة طلبات الصيدليات، المطابقة الدوائية، وإمكانية تجهيز طلبيات مباشرة للصيدليات
+            </p>
           </div>
-          {onOpenApprovals && (
-            <button
-              id="btn-warehouse-open-approvals"
-              onClick={onOpenApprovals}
-              className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-amber-600 to-amber-700 hover:from-amber-700 hover:to-amber-800 text-white rounded-xl text-sm font-bold shadow-sm transition active:scale-95 cursor-pointer"
-            >
-              <ShieldCheck className="w-5 h-5 text-amber-200" />
-              <span>تصاريح وموافقات الدخول</span>
-              {pendingApprovalsCount > 0 && (
-                <span className="bg-white text-amber-900 font-black text-xs px-2 py-0.5 rounded-full animate-pulse">
-                  {pendingApprovalsCount} طلبات معلقة
-                </span>
-              )}
-            </button>
-          )}
-        </div>
 
-        {/* Pending User Approvals Alert Banner */}
-        {pendingApprovalsCount > 0 && onOpenApprovals && (
-          <div className="mb-6 p-4 rounded-2xl bg-gradient-to-r from-amber-500/15 via-amber-400/10 to-amber-500/15 border-2 border-amber-400/60 shadow-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-amber-500 text-white flex items-center justify-center shrink-0 shadow-xs font-bold">
-                <ShieldCheck className="w-6 h-6" />
-              </div>
-              <div>
-                <h4 className="text-sm font-black text-slate-900 flex items-center gap-2">
-                  <span>يوجد {pendingApprovalsCount} طلبات تصاريح دخول وصيدليات جديدة بانتظار موافقتك</span>
-                  <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-amber-500 text-slate-950 animate-pulse">موافقة المشرف</span>
-                </h4>
-                <p className="text-xs text-slate-600 mt-0.5">
-                  لا يمكن للمستخدمين الجدد الوصول إلى الكتالوج أو السلة إلا بعد إصدار تصريح الموافقة من قبلك.
-                </p>
-              </div>
-            </div>
+          <div className="flex flex-wrap items-center gap-2.5">
             <button
-              onClick={onOpenApprovals}
-              className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl shadow-xs transition cursor-pointer flex items-center gap-1.5 shrink-0"
+              id="btn-open-prepared-materials-registry"
+              type="button"
+              onClick={() => setActiveTab('prepared_materials')}
+              className={`px-4 py-2.5 rounded-xl text-xs sm:text-sm font-bold shadow-xs hover:shadow-md transition flex items-center gap-2 cursor-pointer shrink-0 ${
+                activeTab === 'prepared_materials'
+                  ? 'bg-slate-900 text-white ring-2 ring-emerald-400'
+                  : 'bg-gradient-to-r from-emerald-600 to-teal-700 hover:from-emerald-700 hover:to-teal-800 text-white'
+              }`}
+              title="عرض سجل كافة المواد والأدوية المجهزة والمسلمة للصيدليات"
             >
-              <span>مراجعة واعتماد التصاريح</span>
-              <span className="text-amber-400 font-black">({pendingApprovalsCount})</span>
+              <Pill className="w-4 h-4 text-emerald-100" />
+              <span>المواد المجهزة والمسلّمة</span>
+              <span className="px-2 py-0.5 rounded-full text-[11px] font-black bg-white/20 text-white">
+                {preparedMaterialsCount}
+              </span>
+            </button>
+
+            <button
+              id="btn-open-approved-dispatched-registry"
+              type="button"
+              onClick={() => setActiveTab('approved_dispatched')}
+              className={`px-4 py-2.5 rounded-xl text-xs sm:text-sm font-bold shadow-xs hover:shadow-md transition flex items-center gap-2 cursor-pointer shrink-0 ${
+                activeTab === 'approved_dispatched'
+                  ? 'bg-slate-900 text-white ring-2 ring-indigo-400'
+                  : 'bg-gradient-to-r from-blue-600 to-indigo-700 hover:from-blue-700 hover:to-indigo-800 text-white'
+              }`}
+              title="عرض سجل وتوثيق كافة الطلبيات الموافق عليها والصادرة مع التواريخ"
+            >
+              <FileText className="w-4 h-4 text-blue-100" />
+              <span>سجل الصادر والمعتمد مع التاريخ</span>
+              <span className="px-2 py-0.5 rounded-full text-[11px] font-black bg-white/20 text-white">
+                {counts.ready + counts.delivered + counts.preparing}
+              </span>
+            </button>
+
+            <button
+              id="btn-direct-pharmacy-dispatch"
+              type="button"
+              onClick={() => handleOpenDirectDispatch()}
+              className="px-4 py-2.5 bg-gradient-to-r from-emerald-600 via-teal-600 to-emerald-700 hover:from-emerald-700 hover:to-emerald-800 active:from-emerald-900 text-white rounded-xl text-xs sm:text-sm font-bold shadow-xs hover:shadow-md transition flex items-center gap-2 cursor-pointer shrink-0"
+              title="تجهيز وصرف طلبية جديدة لصيدلية مباشرة من قبل موظف المذخر"
+            >
+              <PackagePlus className="w-4 h-4 text-emerald-100" />
+              <span>تجهيز صيدلية مباشرة</span>
             </button>
           </div>
-        )}
+        </div>
 
         {/* Inventory Smart Alerts Widgets (Stock-Out & Near-Expiry) */}
         {alerts && alerts.totalAlerts > 0 && (
@@ -707,6 +1069,57 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
           </button>
         </div>
 
+        {/* Real-time Staff Activity & Preparation Ticker */}
+        {operations && operations.length > 0 && (
+          <div className="bg-gradient-to-r from-amber-50 via-emerald-50 to-blue-50 border border-amber-200/90 rounded-xl p-3.5 mb-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-xs">
+            <div className="flex items-center gap-3">
+              <span className="flex h-3 w-3 relative shrink-0">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
+              </span>
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-[11px] font-black uppercase tracking-wider bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded border border-emerald-300">
+                    بث حركات الموظفين المباشر
+                  </span>
+                  <span className="text-xs font-bold text-slate-900">
+                    {operations[0].performedBy}
+                  </span>
+                  <span className="text-xs text-slate-700">
+                    • {operations[0].details || operations[0].actionTitle}
+                  </span>
+                </div>
+                <p className="text-[10px] text-slate-500 mt-0.5">
+                  آخر حركة مسجلة: {new Date(operations[0].timestamp).toLocaleTimeString('ar-IQ', { hour: '2-digit', minute: '2-digit' })} • تظهر مباشرة لجميع الإدارة وأمناء المخزن
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 self-end sm:self-auto shrink-0">
+              {operations[0].orderNumber && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTab('all');
+                    setSearchTerm(operations[0].orderNumber);
+                  }}
+                  className="px-3 py-1.5 bg-white hover:bg-slate-50 border border-slate-300 text-slate-800 font-bold rounded-lg text-xs transition cursor-pointer shadow-xs flex items-center gap-1"
+                >
+                  <Eye className="w-3.5 h-3.5 text-blue-600" />
+                  <span>عرض الطلبية #{operations[0].orderNumber}</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setActiveTab('operations')}
+                className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 active:bg-amber-800 text-white font-bold rounded-lg text-xs transition cursor-pointer shadow-xs flex items-center gap-1"
+              >
+                <Clock className="w-3.5 h-3.5" />
+                <span>سجل الحركات ({operations.length})</span>
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Filter and Search Bar */}
         <div className="bg-white p-3 rounded-xl border border-slate-200 mb-5 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 shadow-xs">
           <div className="relative flex-1">
@@ -782,6 +1195,42 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
               المرفوضة ({counts.rejected})
             </button>
             <button
+              id="tab-prepared-materials"
+              onClick={() => setActiveTab('prepared_materials')}
+              className={`px-3 py-1.5 rounded-lg transition cursor-pointer flex items-center gap-1.5 ${
+                activeTab === 'prepared_materials'
+                  ? 'bg-emerald-600 text-white font-bold shadow-xs'
+                  : 'bg-emerald-50 text-emerald-800 hover:bg-emerald-100'
+              }`}
+            >
+              <Pill className="w-3.5 h-3.5" />
+              <span>المواد المجهزة والمسلّمة ({preparedMaterialsCount})</span>
+            </button>
+            <button
+              id="tab-approved-dispatched"
+              onClick={() => setActiveTab('approved_dispatched')}
+              className={`px-3 py-1.5 rounded-lg transition cursor-pointer flex items-center gap-1.5 ${
+                activeTab === 'approved_dispatched'
+                  ? 'bg-indigo-600 text-white font-bold shadow-xs'
+                  : 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100'
+              }`}
+            >
+              <FileText className="w-3.5 h-3.5" />
+              <span>سجل الصادر والمعتمد ({counts.ready + counts.delivered + counts.preparing})</span>
+            </button>
+            <button
+              id="tab-operations-stream"
+              onClick={() => setActiveTab('operations')}
+              className={`px-3 py-1.5 rounded-lg transition cursor-pointer flex items-center gap-1.5 ${
+                activeTab === 'operations'
+                  ? 'bg-amber-600 text-white font-bold shadow-xs'
+                  : 'bg-amber-50 text-amber-800 hover:bg-amber-100'
+              }`}
+            >
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+              <span>حركات الكادر المباشرة ({operations.length})</span>
+            </button>
+            <button
               id="tab-pharmacies-directory"
               onClick={() => setActiveTab('pharmacies')}
               className={`px-3 py-1.5 rounded-lg transition cursor-pointer flex items-center gap-1.5 ${
@@ -796,8 +1245,28 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
           </div>
         </div>
 
-        {/* Content View: Either Pharmacies Directory or Orders List */}
-        {activeTab === 'pharmacies' ? (
+        {/* Content View: Prepared Materials Registry, Approved Dispatched Registry, Pharmacies Directory, Operations or Orders List */}
+        {activeTab === 'prepared_materials' ? (
+          <PreparedDeliveredMaterialsRegistry
+            orders={orders}
+            settings={settings}
+            operations={operations}
+            onPrintOrder={(order) => setSelectedOrderForPrint(order)}
+            onViewOrder={(orderId, orderNumber) => {
+              setActiveTab('all');
+              setSearchTerm(orderNumber);
+            }}
+          />
+        ) : activeTab === 'approved_dispatched' ? (
+          <ApprovedDispatchedOrdersRegistry
+            orders={orders}
+            settings={settings}
+            operations={operations}
+            onUpdateOrderStatus={(orderId, newStatus) => onUpdateOrderStatus(orderId, newStatus)}
+            onPrintOrder={(order) => setSelectedOrderForPrint(order)}
+            isEmbedded={true}
+          />
+        ) : activeTab === 'pharmacies' ? (
           <div className="space-y-4">
             {/* Top Sub-Bar for Pharmacies Directory */}
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
@@ -815,15 +1284,28 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
                 </div>
               </div>
 
-              <div className="relative w-full sm:w-72">
-                <Search className="w-4 h-4 absolute right-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                <input
-                  type="text"
-                  placeholder="بحث باسم الصيدلية، الصيدلي، أو الهاتف..."
-                  value={pharmacySearchTerm}
-                  onChange={(e) => setPharmacySearchTerm(e.target.value)}
-                  className="w-full pl-3 pr-9 py-2 bg-slate-50 focus:bg-white text-xs rounded-lg border border-slate-200 focus:outline-hidden focus:border-purple-500 font-medium"
-                />
+              <div className="flex items-center gap-2">
+                <button
+                  id="btn-directory-direct-dispatch"
+                  type="button"
+                  onClick={() => handleOpenDirectDispatch()}
+                  className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white rounded-lg text-xs font-bold transition flex items-center gap-1.5 shadow-xs shrink-0 cursor-pointer"
+                  title="تجهيز وصرف طلبية لصيدلية مباشرة"
+                >
+                  <PackagePlus className="w-4 h-4" />
+                  <span>+ تجهيز صيدلية</span>
+                </button>
+
+                <div className="relative w-full sm:w-64">
+                  <Search className="w-4 h-4 absolute right-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                  <input
+                    type="text"
+                    placeholder="بحث باسم الصيدلية أو الهاتف..."
+                    value={pharmacySearchTerm}
+                    onChange={(e) => setPharmacySearchTerm(e.target.value)}
+                    className="w-full pl-3 pr-9 py-2 bg-slate-50 focus:bg-white text-xs rounded-lg border border-slate-200 focus:outline-hidden focus:border-purple-500 font-medium"
+                  />
+                </div>
               </div>
             </div>
 
@@ -910,7 +1392,7 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
                         <div className="flex items-center justify-between text-slate-600">
                           <span className="text-slate-400">إجمالي المسحوبات:</span>
                           <span className="font-bold text-emerald-700">
-                            {pharmacy.totalSpent.toLocaleString()} {settings.currency}
+                            {(pharmacy.totalSpent ?? 0).toLocaleString()} {settings.currency}
                           </span>
                         </div>
 
@@ -921,28 +1403,40 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-2 pt-3 border-t border-slate-100">
+                    <div className="flex flex-wrap items-center gap-1.5 pt-3 border-t border-slate-100">
+                      <button
+                        type="button"
+                        id={`btn-dispatch-pharmacy-${encodeURIComponent(pharmacy.name)}`}
+                        onClick={() => handleOpenDirectDispatch(pharmacy.name)}
+                        className="flex-1 py-2 px-2.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 hover:border-emerald-300 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer shadow-2xs"
+                        title="تجهيز وصرف طلبية لهذه الصيدلية مباشرة"
+                      >
+                        <PackagePlus className="w-3.5 h-3.5 text-emerald-700" />
+                        <span>تجهيز طلبية</span>
+                      </button>
+
                       <button
                         type="button"
                         onClick={() => {
                           setSearchTerm(pharmacy.name);
                           setActiveTab('all');
                         }}
-                        className="flex-1 py-2 px-2.5 bg-slate-50 hover:bg-purple-50 text-slate-700 hover:text-purple-700 border border-slate-200 hover:border-purple-300 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer"
+                        className="py-2 px-2.5 bg-slate-50 hover:bg-purple-50 text-slate-700 hover:text-purple-700 border border-slate-200 hover:border-purple-300 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer"
+                        title="عرض طلبات هذه الصيدلية"
                       >
                         <Eye className="w-3.5 h-3.5" />
-                        <span>عرض الطلبات</span>
+                        <span>الطلبات</span>
                       </button>
 
                       {onOpenShareModalForPharmacy && (
                         <button
                           type="button"
                           onClick={() => onOpenShareModalForPharmacy(pharmacy.name)}
-                          className="py-2 px-2.5 bg-white hover:bg-slate-50 text-blue-600 border border-slate-200 rounded-lg text-xs font-bold transition flex items-center gap-1 cursor-pointer"
+                          className="py-2 px-2 bg-white hover:bg-slate-50 text-blue-600 border border-slate-200 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer"
                           title="مشاركة رابط طلب مخصص لهذه الصيدلية"
                         >
                           <Share2 className="w-3.5 h-3.5" />
-                          <span className="hidden sm:inline">رابط مخصص</span>
+                          <span className="hidden sm:inline">رابط</span>
                         </button>
                       )}
 
@@ -953,15 +1447,328 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
                           ordersCount: pharmacy.ordersCount,
                           deleteOrders: true
                         })}
-                        className="py-2 px-2.5 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-lg text-xs font-bold transition flex items-center gap-1 cursor-pointer"
+                        className="p-2 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-lg text-xs font-bold transition flex items-center justify-center cursor-pointer"
                         title="حذف الصيدلية"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
-                        <span>حذف</span>
                       </button>
                     </div>
                   </div>
                 ))}
+              </div>
+            )}
+          </div>
+        ) : activeTab === 'operations' ? (
+          <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs space-y-4">
+            {/* Operations Header */}
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 border-b border-slate-100 pb-4">
+              <div className="flex items-center gap-3">
+                <div className="w-11 h-11 rounded-xl bg-amber-50 border border-amber-200 text-amber-700 flex items-center justify-center font-bold shadow-xs shrink-0">
+                  <Clock className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-black text-slate-900 flex items-center gap-2">
+                    <span>سجل حركات وتجهيز الكادر المباشر مع تفاصيل المواد</span>
+                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    كافة عمليات التجهيز، الصرف، وتحديث حالات الطلبيات مع إظهار المواد الدوائية والكميات والوجبات المصروفة
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-bold text-slate-700 bg-slate-100 px-3 py-1.5 rounded-lg border border-slate-200">
+                  إجمالي الحركات: {operations.length}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('prepared_materials')}
+                  className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow-xs"
+                >
+                  <Pill className="w-3.5 h-3.5" />
+                  <span>عرض حصر كافة المواد ({preparedMaterialsCount})</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Filter and Search Bar for Operations */}
+            <div className="bg-slate-50 p-3 rounded-xl border border-slate-200/80 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+              <div className="relative flex-1">
+                <Search className="w-4 h-4 absolute right-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="text"
+                  value={operationsSearchTerm}
+                  onChange={(e) => setOperationsSearchTerm(e.target.value)}
+                  placeholder="ابحث في الإجراءات، الموظف، المادة الدوائية، الصيدلية، رقم الطلب..."
+                  className="w-full pr-9 pl-3 py-2 bg-white border border-slate-200 rounded-lg text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-amber-500 font-medium"
+                />
+                {operationsSearchTerm && (
+                  <button
+                    type="button"
+                    onClick={() => setOperationsSearchTerm('')}
+                    className="absolute left-3 top-1/2 -translate-y-1/2 text-xs text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    مسح
+                  </button>
+                )}
+              </div>
+
+              <div className="flex items-center gap-1 overflow-x-auto pb-1 sm:pb-0">
+                <button
+                  type="button"
+                  onClick={() => setOperationsTypeFilter('all')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap transition cursor-pointer ${
+                    operationsTypeFilter === 'all'
+                      ? 'bg-slate-900 text-white shadow-2xs'
+                      : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200'
+                  }`}
+                >
+                  الكل ({operations.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setOperationsTypeFilter('prepared_delivered')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap transition cursor-pointer ${
+                    operationsTypeFilter === 'prepared_delivered'
+                      ? 'bg-emerald-600 text-white shadow-2xs'
+                      : 'bg-white text-emerald-700 hover:bg-emerald-50 border border-slate-200'
+                  }`}
+                >
+                  تجهيز وتسليم
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setOperationsTypeFilter('created_edited')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap transition cursor-pointer ${
+                    operationsTypeFilter === 'created_edited'
+                      ? 'bg-blue-600 text-white shadow-2xs'
+                      : 'bg-white text-blue-700 hover:bg-blue-50 border border-slate-200'
+                  }`}
+                >
+                  إنشاء وتعديل
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setOperationsTypeFilter('status_changed')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap transition cursor-pointer ${
+                    operationsTypeFilter === 'status_changed'
+                      ? 'bg-amber-600 text-white shadow-2xs'
+                      : 'bg-white text-amber-700 hover:bg-amber-50 border border-slate-200'
+                  }`}
+                >
+                  تغيير الحالات
+                </button>
+              </div>
+            </div>
+
+            {/* Operations List */}
+            {filteredOperations.length === 0 ? (
+              <div className="py-12 text-center text-slate-400">
+                <Clock className="w-10 h-10 mx-auto mb-2 text-slate-300" />
+                <p className="text-sm font-bold text-slate-700">لا توجد حركات مسجلة تطابق البحث</p>
+                <p className="text-xs text-slate-500 mt-1">
+                  تأكد من إلغاء فلاتر البحث أو اختيار تصنيف آخر لعرض الحركات والإجراءات
+                </p>
+                {(operationsSearchTerm || operationsTypeFilter !== 'all') && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOperationsSearchTerm('');
+                      setOperationsTypeFilter('all');
+                    }}
+                    className="mt-3 px-3 py-1.5 bg-slate-800 text-white rounded-lg text-xs font-bold cursor-pointer"
+                  >
+                    إعادة تعيين الفلاتر
+                  </button>
+                )}
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-100">
+                {filteredOperations.map((op) => {
+                  const targetOrder = orders.find((o) => o.id === op.orderId || o.orderNumber === op.orderNumber);
+                  const opItems =
+                    op.items && op.items.length > 0
+                      ? op.items
+                      : targetOrder?.items || [];
+                  const totalOpBoxes = opItems.reduce(
+                    (acc, i) => acc + (i.quantity || 0) + (i.bonusQuantity || 0),
+                    0
+                  );
+                  const totalOpMoney = opItems.reduce(
+                    (acc, i) => acc + (i.totalPrice ?? ((i.quantity || 0) * (i.unitPrice || 0)) ?? 0),
+                    0
+                  );
+                  const isExpanded = expandedOpIds.has(op.id) || opItems.length <= 3;
+                  const displayedItems = isExpanded ? opItems : opItems.slice(0, 3);
+
+                  return (
+                    <div key={op.id} className="py-4 hover:bg-slate-50/70 px-2 rounded-xl transition space-y-3">
+                      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                        <div className="flex items-start gap-3">
+                          <div className="w-10 h-10 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 flex items-center justify-center shrink-0 mt-0.5 font-bold text-sm shadow-2xs">
+                            {op.type === 'order_prepared'
+                              ? '📦'
+                              : op.type === 'order_created'
+                              ? '✨'
+                              : op.type === 'order_edited'
+                              ? '✏️'
+                              : '🔄'}
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className="font-bold text-slate-900 text-sm">
+                                {op.performedBy}
+                              </span>
+                              <span className="text-xs text-slate-400">•</span>
+                              <span className="text-xs text-slate-800 font-bold bg-slate-100 px-2.5 py-0.5 rounded-md border border-slate-200">
+                                {op.details ||
+                                  (op.type === 'order_prepared'
+                                    ? 'تم تجهيز وفحص الطلبية'
+                                    : op.type === 'order_created'
+                                    ? 'إنشاء طلبية مباشرة'
+                                    : 'تحديث حالة الطلب')}
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-slate-500 flex items-center gap-2 mt-1.5 flex-wrap">
+                              <span>{new Date(op.timestamp).toLocaleDateString('ar-IQ')}</span>
+                              <span>•</span>
+                              <span dir="ltr">
+                                {new Date(op.timestamp).toLocaleTimeString('ar-IQ', {
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                })}
+                              </span>
+                              {op.orderNumber && (
+                                <>
+                                  <span>•</span>
+                                  <span className="font-mono font-bold text-blue-700 bg-blue-50 border border-blue-200 px-2 py-0.2 rounded">
+                                    #{op.orderNumber}
+                                  </span>
+                                </>
+                              )}
+                              {op.pharmacyName && (
+                                <>
+                                  <span>•</span>
+                                  <span className="font-semibold text-slate-700 flex items-center gap-1">
+                                    <Store className="w-3 h-3 text-slate-400" />
+                                    <span>{op.pharmacyName}</span>
+                                  </span>
+                                </>
+                              )}
+                            </p>
+                          </div>
+                        </div>
+
+                        {/* Action Buttons */}
+                        <div className="flex items-center gap-1.5 self-end sm:self-auto shrink-0">
+                          {op.orderNumber && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setActiveTab('all');
+                                setSearchTerm(op.orderNumber);
+                              }}
+                              className="px-3 py-1.5 bg-white hover:bg-slate-100 border border-slate-200 text-blue-700 font-bold rounded-lg text-xs transition cursor-pointer shadow-2xs flex items-center gap-1"
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                              <span>عرض الطلب #{op.orderNumber}</span>
+                            </button>
+                          )}
+                          {targetOrder && (
+                            <button
+                              type="button"
+                              onClick={() => setSelectedOrderForPrint(targetOrder)}
+                              className="p-1.5 bg-white hover:bg-emerald-50 border border-slate-200 text-emerald-700 font-bold rounded-lg text-xs transition cursor-pointer shadow-2xs"
+                              title="طباعة وصل الطلبية"
+                            >
+                              <FileText className="w-4 h-4" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Materials involved in this procedure */}
+                      {opItems.length > 0 && (
+                        <div className="mr-0 sm:mr-13 bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2.5">
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 border-b border-slate-200/70 pb-2">
+                            <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                              <Pill className="w-3.5 h-3.5 text-emerald-600" />
+                              <span>المواد المشمولة بالإجراء:</span>
+                              <span className="text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded font-mono font-bold">
+                                {opItems.length} صنف ({totalOpBoxes} علبة)
+                              </span>
+                            </span>
+                            <div className="flex items-center gap-2">
+                              <span className="text-[11px] font-mono font-bold text-slate-700">
+                                القيمة: {totalOpMoney.toLocaleString()} {settings.currency}
+                              </span>
+                              {opItems.length > 3 && (
+                                <button
+                                  type="button"
+                                  onClick={() => toggleOpExpanded(op.id)}
+                                  className="text-[11px] font-bold text-blue-700 hover:text-blue-900 bg-blue-50 hover:bg-blue-100 px-2 py-0.5 rounded transition cursor-pointer"
+                                >
+                                  {isExpanded ? 'طي القائمة ⬆' : `عرض الكل (+${opItems.length - 3}) ⬇`}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Grid of Materials */}
+                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                            {displayedItems.map((item, iIdx) => (
+                              <div
+                                key={iIdx}
+                                className="p-2.5 bg-white rounded-lg border border-slate-200/90 shadow-2xs hover:border-slate-300 transition text-xs flex flex-col justify-between space-y-1.5"
+                              >
+                                <div className="flex items-start justify-between gap-1">
+                                  <div>
+                                    <span className="font-bold text-slate-900 block line-clamp-1">
+                                      {item.tradeNameAr}
+                                    </span>
+                                    {item.tradeNameEn && (
+                                      <span className="text-[10px] font-mono text-slate-400 block line-clamp-1">
+                                        {item.tradeNameEn}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <span className="font-mono font-black text-blue-700 bg-blue-50 border border-blue-100 px-1.5 py-0.5 rounded text-[11px] shrink-0">
+                                    ×{item.quantity} {item.bonusQuantity > 0 ? `(+${item.bonusQuantity})` : ''}
+                                  </span>
+                                </div>
+
+                                <div className="flex items-center justify-between text-[11px] text-slate-500 pt-1 border-t border-slate-100">
+                                  <span className="font-mono text-slate-600" title="تاريخ الصلاحية المؤكد">
+                                    📅 {item.confirmedExpiry || item.expiryDate || '—'}
+                                  </span>
+                                  <span className="font-bold font-mono text-emerald-700">
+                                    {(item.totalPrice || (item.quantity * item.unitPrice) || 0).toLocaleString()} {settings.currency}
+                                  </span>
+                                </div>
+
+                                {(item.confirmedBatch || item.batchNumber) && (
+                                  <div className="text-[10px] text-slate-500 font-mono">
+                                    وجبة (Batch): <span className="font-bold text-slate-700">{item.confirmedBatch || item.batchNumber}</span>
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+
+                          {!isExpanded && opItems.length > 3 && (
+                            <button
+                              type="button"
+                              onClick={() => toggleOpExpanded(op.id)}
+                              className="w-full py-1.5 text-center text-xs font-bold text-slate-600 hover:text-slate-900 bg-white hover:bg-slate-100 rounded-lg border border-slate-200 transition cursor-pointer"
+                            >
+                              عرض باقي المواد لهذا الإجراء ({opItems.length - 3} أصناف إضافية)...
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>
@@ -970,13 +1777,55 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
           filteredOrders.length === 0 ? (
             <div className="bg-white rounded-2xl p-12 text-center border border-slate-200 max-w-md mx-auto">
               <PackageCheck className="w-12 h-12 text-slate-300 mx-auto mb-3" />
-              <h3 className="text-base font-bold text-slate-800">لا توجد طلبات في هذا القسم</h3>
+              <h3 className="text-base font-bold text-slate-800">
+                {activeTab === 'new' ? 'لا توجد طلبات جديدة معلقة حالياً' : 'لا توجد طلبات في هذا القسم'}
+              </h3>
               <p className="text-xs text-slate-500 mt-1">
-                عند قيام أي صيدلية باختيار مواد وإرسال السلة، ستظهر الطلبية هنا مع تنبيه صوتي فوري.
+                {activeTab === 'new' && (counts.ready > 0 || counts.preparing > 0)
+                  ? `تم تجهيز طلبيات سابقة بواسطة الكادر (${counts.ready} جاهزة للتسليم، ${counts.preparing} قيد التجهيز) وتظهر للجميع في الأقسام المخصصة.`
+                  : 'عند قيام أي صيدلية باختيار مواد وإرسال السلة، ستظهر الطلبية هنا مع تنبيه صوتي فوري.'}
               </p>
+              {activeTab === 'new' && (counts.ready > 0 || counts.preparing > 0) && (
+                <div className="mt-4 flex items-center justify-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('ready')}
+                    className="px-3.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold transition shadow-xs cursor-pointer"
+                  >
+                    عرض الطلبيات الجاهزة ({counts.ready})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('all')}
+                    className="px-3.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-bold transition cursor-pointer"
+                  >
+                    عرض كافة الطلبات ({orders.length})
+                  </button>
+                </div>
+              )}
             </div>
           ) : (
             <div className="space-y-4">
+              {activeTab === 'new' && filteredOrders.length > 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 bg-rose-50/80 border border-rose-200 rounded-xl">
+                  <div className="flex items-center gap-2 text-rose-950 text-xs font-bold">
+                    <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                    <span>
+                      يوجد {filteredOrders.length} طلبات جديدة معلقة بانتظار فحص الصلاحيات والتجهيز.
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    id="btn-delete-all-pending-orders"
+                    onClick={() => setShowDeleteAllPendingModal(true)}
+                    className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 active:bg-rose-800 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition shadow-xs cursor-pointer"
+                    title="حذف وإلغاء كافة الطلبات المعلقة في هذا القسم"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>حذف كافة الطلبات المعلقة ({filteredOrders.length})</span>
+                  </button>
+                </div>
+              )}
               {filteredOrders.map((order) => {
                 const verifiedItemsCount = order.items.filter((i) => i.verified).length;
                 const allVerified = verifiedItemsCount === order.items.length;
@@ -1012,7 +1861,24 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
                         </div>
                       </div>
 
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        {order.preparedBy && (
+                          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-amber-50 text-amber-900 border border-amber-300 shadow-2xs">
+                            <UserCheck className="w-3.5 h-3.5 text-amber-700" />
+                            <span>تم التجهيز بواسطة: <strong className="text-amber-950">{order.preparedBy}</strong></span>
+                            {order.preparedAt && (
+                              <span className="text-[10px] text-amber-800 font-normal">
+                                ({new Date(order.preparedAt).toLocaleTimeString('ar-IQ', { hour: '2-digit', minute: '2-digit' })})
+                              </span>
+                            )}
+                          </span>
+                        )}
+                        {order.source === 'direct' && (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-300 shadow-2xs">
+                            <PackagePlus className="w-3.5 h-3.5 text-emerald-700" />
+                            تجهيز مباشر من المذخر
+                          </span>
+                        )}
                         {getStatusBadge(order.status)}
                       </div>
                     </div>
@@ -1045,26 +1911,66 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
                               <td className="p-2.5 font-bold text-emerald-700">
                                 {item.confirmedExpiry || item.expiryDate}
                               </td>
-                              <td className="p-2.5 text-center font-bold text-slate-800">
-                                {item.quantity}
+                              <td className="p-2.5 text-center">
+                                <div className="inline-flex items-center justify-center gap-1 bg-slate-50 hover:bg-slate-100/90 border border-slate-200 rounded-lg p-0.5 transition">
+                                  {order.status !== 'delivered' && order.status !== 'rejected' && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleQuickAdjustItemQuantity(order, item.productId, -1)}
+                                      disabled={item.quantity <= 1}
+                                      className="w-5 h-5 rounded flex items-center justify-center text-slate-500 hover:text-rose-700 hover:bg-rose-50 disabled:opacity-25 transition cursor-pointer font-bold"
+                                      title="إنقاص علبة (-1)"
+                                    >
+                                      <Minus className="w-3 h-3" />
+                                    </button>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={() => setOrderToEditQuantities(order)}
+                                    className="px-1.5 py-0.5 text-xs font-mono font-black text-slate-900 hover:text-amber-700 hover:bg-amber-50 rounded transition cursor-pointer flex items-center gap-1"
+                                    title="انقر لفتح نافذة تعديل الكميات وبونص الطلبية"
+                                  >
+                                    <span>{item.quantity}</span>
+                                    {order.status !== 'delivered' && order.status !== 'rejected' && (
+                                      <Edit3 className="w-2.5 h-2.5 text-slate-400" />
+                                    )}
+                                  </button>
+                                  {order.status !== 'delivered' && order.status !== 'rejected' && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleQuickAdjustItemQuantity(order, item.productId, 1)}
+                                      className="w-5 h-5 rounded flex items-center justify-center text-slate-500 hover:text-emerald-700 hover:bg-emerald-50 transition cursor-pointer font-bold"
+                                      title="زيادة علبة (+1)"
+                                    >
+                                      <Plus className="w-3 h-3" />
+                                    </button>
+                                  )}
+                                </div>
                               </td>
                               <td className="p-2.5 text-center">
-                                {item.bonusQuantity > 0 ? (
-                                  <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-bold text-[10px]">
-                                    + {item.bonusQuantity}
-                                  </span>
-                                ) : (
-                                  <span className="text-slate-300">-</span>
-                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => setOrderToEditQuantities(order)}
+                                  className="cursor-pointer hover:opacity-80 transition"
+                                  title="اضغط لتعديل البونص أو الكميات"
+                                >
+                                  {item.bonusQuantity > 0 ? (
+                                    <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-bold text-[10px] inline-flex items-center gap-0.5">
+                                      + {item.bonusQuantity}
+                                    </span>
+                                  ) : (
+                                    <span className="text-slate-300">-</span>
+                                  )}
+                                </button>
                               </td>
                               <td className="p-2.5 font-semibold text-slate-600">
-                                {item.unitPrice.toLocaleString()} {settings.currency}
+                                {(item.unitPrice ?? 0).toLocaleString()} {settings.currency}
                               </td>
                               <td className="p-2.5 font-bold text-blue-700">
-                                {item.totalPrice.toLocaleString()} {settings.currency}
+                                {(item.totalPrice ?? (item.quantity * item.unitPrice) ?? 0).toLocaleString()} {settings.currency}
                               </td>
                               <td className="p-2.5 text-center">
-                                {item.status === 'unavailable' ? (
+                                {item?.status === 'unavailable' ? (
                                   <div className="flex flex-col items-center gap-1">
                                     <span className="inline-flex items-center gap-1 text-[10px] font-bold text-rose-700 bg-rose-50 border border-rose-200 px-2 py-0.5 rounded">
                                       <XCircle className="w-3 h-3 text-rose-600" /> تعذر التجهيز (نفذ)
@@ -1115,6 +2021,25 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
                       </div>
                     )}
 
+                    {/* Edited Quantities Banner */}
+                    {order.editedAt && (
+                      <div className="bg-amber-50/80 border border-amber-200 rounded-lg p-2.5 text-xs text-amber-900 flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <Edit3 className="w-4 h-4 text-amber-700 shrink-0" />
+                          <span>
+                            <strong>تم تعديل كميات الطلبية:</strong> {order.editReason || 'تعديل يدوي من إدارة المخزن'} ({new Date(order.editedAt).toLocaleTimeString('ar-IQ', { hour: '2-digit', minute: '2-digit' })})
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setOrderToEditQuantities(order)}
+                          className="px-2 py-0.5 bg-amber-100 hover:bg-amber-200 text-amber-900 font-bold rounded text-[11px] transition cursor-pointer"
+                        >
+                          تعديل مجدداً
+                        </button>
+                      </div>
+                    )}
+
                     {order.status === 'rejected' && (
                       <div className="bg-rose-50 border border-rose-200 rounded-lg p-2.5 text-xs text-rose-900 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                         <div className="flex items-center gap-2">
@@ -1140,7 +2065,7 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
                         <div>
                           <span className="text-slate-400 block text-[11px]">المبلغ الإجمالي المطلوب:</span>
                           <span className="text-base font-bold text-blue-700">
-                            {order.totalAmount.toLocaleString()} {settings.currency}
+                            {(order.totalAmount ?? 0).toLocaleString()} {settings.currency}
                           </span>
                         </div>
                         <div className="h-6 w-px bg-slate-200"></div>
@@ -1154,6 +2079,19 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
 
                       {/* Action buttons */}
                       <div className="flex flex-wrap items-center gap-2">
+                        {/* Edit Quantities Button */}
+                        {order.status !== 'delivered' && (
+                          <button
+                            id={`btn-edit-quantities-${order.id}`}
+                            onClick={() => setOrderToEditQuantities(order)}
+                            className="px-3.5 py-2 bg-amber-50 hover:bg-amber-100 active:bg-amber-200 border border-amber-300 text-amber-900 rounded-lg text-xs font-bold flex items-center gap-1.5 transition shadow-xs cursor-pointer"
+                            title="تعديل كميات وبونص المواد أو إضافة وحذف مواد في هذه الطلبية"
+                          >
+                            <Edit3 className="w-4 h-4 text-amber-700" />
+                            <span>تعديل الكميات</span>
+                          </button>
+                        )}
+
                         {/* Direct Accept & Export List Button */}
                         {order.status !== 'rejected' && (
                           <button
@@ -1221,11 +2159,15 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
                         <button
                           id={`btn-delete-${order.id}`}
                           onClick={() => setOrderToDelete(order)}
-                          className="px-3 py-2 bg-slate-100 hover:bg-rose-50 border border-slate-200 hover:border-rose-300 text-slate-600 hover:text-rose-700 rounded-lg text-xs font-bold flex items-center gap-1.5 transition shadow-xs cursor-pointer"
-                          title="حذف هذا الطلب نهائياً"
+                          className={`px-3 py-2 border rounded-lg text-xs font-bold flex items-center gap-1.5 transition shadow-xs cursor-pointer ${
+                            order.status === 'new'
+                              ? 'bg-rose-50 hover:bg-rose-100 border-rose-200 text-rose-700'
+                              : 'bg-slate-100 hover:bg-rose-50 border-slate-200 hover:border-rose-300 text-slate-600 hover:text-rose-700'
+                          }`}
+                          title={order.status === 'new' ? 'إلغاء وحذف هذا الطلب المعلق نهائياً' : 'حذف هذا الطلب نهائياً'}
                         >
-                          <Trash2 className="w-3.5 h-3.5" />
-                          <span>حذف الطلب</span>
+                          <Trash2 className="w-3.5 h-3.5 text-rose-600" />
+                          <span>{order.status === 'new' ? 'حذف الطلب المعلق' : 'حذف الطلب'}</span>
                         </button>
                       </div>
                     </div>
@@ -1284,6 +2226,7 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
               {selectedOrderForPrep.items.map((item, idx) => {
                 const check = itemChecklist[item.productId] || {
                   verified: false,
+                  status: 'available' as const,
                   confirmedBatch: item.batchNumber,
                   confirmedExpiry: item.expiryDate,
                   notes: '',
@@ -1320,7 +2263,16 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
                                 + {item.bonusQuantity} بونص مجاني
                               </span>
                             )}
-                            {check.status === 'unavailable' ? (
+                            <button
+                              type="button"
+                              onClick={() => setOrderToEditQuantities(selectedOrderForPrep)}
+                              className="text-xs font-bold text-amber-800 hover:text-amber-950 bg-amber-50 hover:bg-amber-100 border border-amber-300 px-2 py-0.5 rounded-md transition cursor-pointer flex items-center gap-1"
+                              title="تعديل كميات هذه الطلبية"
+                            >
+                              <Edit3 className="w-3 h-3 text-amber-700" />
+                              <span>تعديل الكمية</span>
+                            </button>
+                            {check?.status === 'unavailable' ? (
                               <button
                                 type="button"
                                 onClick={() => setItemAvailability(item.productId, 'available')}
@@ -1346,7 +2298,7 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
 
                       <div className="text-left text-xs">
                         <span className="font-bold text-slate-700 block">
-                          الإجمالي: {item.totalPrice.toLocaleString()} {settings.currency}
+                          الإجمالي: {(item.totalPrice ?? (item.quantity * item.unitPrice) ?? 0).toLocaleString()} {settings.currency}
                         </span>
                       </div>
                     </div>
@@ -1552,15 +2504,15 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
                       <td className="p-2 border border-slate-300 text-center">
                         {item.isBonusMelted && item.meltedUnitPrice ? (
                           <div>
-                            <span className="font-bold text-emerald-800">{item.meltedUnitPrice.toLocaleString()}</span>
+                            <span className="font-bold text-emerald-800">{(item.meltedUnitPrice ?? item.unitPrice ?? 0).toLocaleString()}</span>
                             <span className="block text-[9px] text-emerald-600 font-bold">تذويب {item.bonusPercentage}%</span>
                           </div>
                         ) : (
-                          item.unitPrice.toLocaleString()
+                          (item.unitPrice ?? 0).toLocaleString()
                         )}
                       </td>
                       <td className="p-2 border border-slate-300 text-left font-black">
-                        {item.totalPrice.toLocaleString()} {settings.currency}
+                        {(item.totalPrice ?? (item.quantity * item.unitPrice) ?? 0).toLocaleString()} {settings.currency}
                       </td>
                     </tr>
                   ))}
@@ -1581,7 +2533,7 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
                   <div className="flex justify-between border-t border-slate-300 pt-2 text-sm">
                     <span className="font-black text-slate-900">المبلغ الصافي المطلوب:</span>
                     <span className="font-black text-slate-900">
-                      {selectedOrderForPrint.totalAmount.toLocaleString()} {settings.currency}
+                      {(selectedOrderForPrint?.totalAmount ?? 0).toLocaleString()} {settings.currency}
                     </span>
                   </div>
                 </div>
@@ -1741,8 +2693,8 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
               </p>
               <p className="text-rose-800">
                 سيتم حذف طلبية <strong>{orderToDelete.pharmacyName}</strong> ذات القيمة الإجمالية{' '}
-                <strong>{orderToDelete.totalAmount.toLocaleString()} {settings.currency}</strong> ومجموع{' '}
-                <strong>{orderToDelete.items.length}</strong> أصناف دوائية من قاعدة البيانات.
+                <strong>{(orderToDelete.totalAmount ?? 0).toLocaleString()} {settings.currency}</strong> ومجموع{' '}
+                <strong>{orderToDelete.items?.length || 0}</strong> أصناف دوائية من قاعدة البيانات.
               </p>
             </div>
 
@@ -1762,6 +2714,66 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
               >
                 <Trash2 className="w-4 h-4" />
                 <span>نعم، احذف الطلب نهائياً</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete All Pending Orders Confirmation Modal */}
+      {showDeleteAllPendingModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-md bg-white rounded-2xl p-6 shadow-2xl space-y-4 animate-in zoom-in-95 duration-200">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-10 h-10 rounded-xl bg-rose-100 text-rose-600 flex items-center justify-center border border-rose-200">
+                  <Trash2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900">
+                    تأكيد حذف كافة الطلبات المعلقة
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    {orders.filter((o) => o.status === 'new' || (o.status as string) === 'pending').length} طلبيات جديدة معلقة
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowDeleteAllPendingModal(false)}
+                className="text-slate-400 hover:text-slate-600 p-1.5 rounded-lg hover:bg-slate-100 transition cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="bg-rose-50/70 border border-rose-100 rounded-xl p-3.5 text-xs text-rose-950 space-y-2">
+              <p className="font-bold flex items-center gap-1 text-rose-700">
+                <AlertCircle className="w-4 h-4 shrink-0" /> تحذير: هذا الإجراء نهائي ولا يمكن التراجع عنه
+              </p>
+              <p className="text-rose-800">
+                هل أنت متأكد من رغبتك في حذف وإلغاء جميع الطلبات الجديدة المعلقة (
+                {orders.filter((o) => o.status === 'new' || (o.status as string) === 'pending').length} طلبية)؟
+                سيتم حذفها نهائياً من قاعدة البيانات وسجلات التجهيز.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setShowDeleteAllPendingModal(false)}
+                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-semibold transition cursor-pointer"
+              >
+                إلغاء
+              </button>
+              <button
+                type="button"
+                id="btn-confirm-delete-all-pending"
+                disabled={isDeletingAllPending}
+                onClick={handleConfirmDeleteAllPending}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 active:bg-rose-800 text-white rounded-lg text-xs font-bold transition shadow-xs cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
+              >
+                <Trash2 className="w-4 h-4" />
+                <span>{isDeletingAllPending ? 'جاري الحذف...' : 'نعم، حذف كل الطلبات المعلقة'}</span>
               </button>
             </div>
           </div>
@@ -1847,6 +2859,49 @@ export const WarehouseDashboard: React.FC<WarehouseDashboardProps> = ({
             </div>
           </div>
         </div>
+      )}
+
+      {/* Modal for Editing Order Quantities & Bonus */}
+      {orderToEditQuantities && (
+        <EditOrderQuantitiesModal
+          isOpen={true}
+          onClose={() => setOrderToEditQuantities(null)}
+          order={orderToEditQuantities}
+          products={products}
+          currency={settings.currency}
+          onSaveOrder={(updatedOrder) => {
+            handleSaveOrderQuantities(updatedOrder);
+            setOrderToEditQuantities(null);
+          }}
+        />
+      )}
+
+      {/* Modal for Direct Pharmacy Dispatch by Warehouse Staff */}
+      {isDirectDispatchOpen && (
+        <DirectPharmacyDispatchModal
+          isOpen={true}
+          onClose={() => {
+            setIsDirectDispatchOpen(false);
+            setDirectDispatchInitialPharmacy(undefined);
+          }}
+          products={products}
+          existingPharmacies={pharmaciesList.map((p) => ({
+            name: p.name,
+            pharmacistName: p.pharmacistName,
+            phone: p.phone,
+            address: p.address,
+            ordersCount: p.ordersCount,
+          }))}
+          initialPharmacyName={directDispatchInitialPharmacy}
+          settings={settings}
+          onSaveDirectOrder={(newOrder, postAction, keepOpenForNext) => {
+            handleSaveDirectOrder(newOrder, postAction);
+            if (!keepOpenForNext && postAction === 'none') {
+              setIsDirectDispatchOpen(false);
+              setDirectDispatchInitialPharmacy(undefined);
+            }
+          }}
+        />
       )}
     </div>
   );

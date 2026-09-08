@@ -15,7 +15,8 @@ import {
   LogOut,
   Lock,
   User,
-  Menu
+  Menu,
+  Bell
 } from 'lucide-react';
 import { PWAInstallButton } from './PWAInstallButton';
 import { OfflineSyncBadge } from './OfflineSyncBadge';
@@ -133,31 +134,25 @@ export const Header: React.FC<HeaderProps> = ({
 
           {/* Edge Left (RTL): Action Buttons & Utilities */}
           <div className="flex items-center gap-1 sm:gap-2 shrink-0">
-            {/* Security & Access Management button for Owner and Super Admin */}
-            {(currentUser?.role === 'owner' || currentUser?.role === 'super_admin' || currentUser?.founder || currentUser?.role === 'warehouse_manager') && onOpenApprovals && (
-              <button
-                id="btn-open-user-approvals"
-                onClick={onOpenApprovals}
-                className="relative flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 bg-gradient-to-r from-slate-900 to-blue-950 hover:from-slate-800 hover:to-blue-900 text-white rounded-xl text-xs sm:text-sm font-bold shadow-xs transition cursor-pointer shrink-0 active:scale-95 border border-slate-700/60"
-                title="إدارة موافقات وتصاريح الدخول"
-              >
-                <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
-                <span className="inline font-bold">تصاريح الموافقات</span>
-                {pendingApprovalsCount > 0 && (
-                  <span className="min-w-[18px] h-[18px] px-1 bg-amber-500 text-slate-950 text-[10px] font-black rounded-full flex items-center justify-center animate-pulse shrink-0">
-                    {pendingApprovalsCount}
-                  </span>
-                )}
-              </button>
-            )}
-
             {/* Profile / Logout */}
             {currentUser ? (
               <div className="flex items-center gap-1 shrink-0 bg-slate-50 px-1 sm:px-2 py-1 rounded-xl border border-slate-200">
                 <div className="hidden md:flex flex-col text-left text-xs font-semibold leading-tight">
                   <span className="text-slate-800 font-bold max-w-[110px] truncate">{currentUser.pharmacyName || currentUser.name}</span>
                   <span className="text-[10px] text-emerald-600 font-bold">
-                    {currentUser.role === 'super_admin' ? 'المدير الأعلى' : currentUser.role === 'owner' ? 'صاحب المذخر' : currentUser.role === 'warehouse_manager' ? 'مدير المستودع' : 'صيدلية معتمدة'}
+                    {currentUser.role === 'founder' || currentUser.founder
+                      ? 'المؤسس والمدير الأعلى'
+                      : currentUser.role === 'warehouse' || currentUser.role === 'owner'
+                      ? 'صاحب مذخر'
+                      : currentUser.role === 'super_admin'
+                      ? 'المدير الأعلى'
+                      : currentUser.role === 'warehouse_manager'
+                      ? 'مدير المستودع'
+                      : currentUser.role === 'staff' || currentUser.role === 'pharmacist_staff'
+                      ? 'كادر المذخر'
+                      : currentUser.role === 'auditor_readonly'
+                      ? 'مدقق حسابات'
+                      : 'صيدلية معتمدة'}
                   </span>
                 </div>
                 {onLogout && (
@@ -181,6 +176,43 @@ export const Header: React.FC<HeaderProps> = ({
                   <span>دخول</span>
                 </button>
               )
+            )}
+
+            {/* 🔔 Badge مرئي في الشريط العلوي للوحة الإدارة يوضح عدد الطلبات المعلقة (تنبيه برتقالي/أحمر) */}
+            {onOpenApprovals && (
+              <button
+                id="btn-header-pending-badge"
+                type="button"
+                onClick={onOpenApprovals}
+                className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-xl border text-xs sm:text-sm font-black transition cursor-pointer shrink-0 active:scale-95 ${
+                  pendingApprovalsCount > 0
+                    ? 'bg-amber-500 hover:bg-amber-600 text-slate-950 border-amber-400 shadow-md shadow-amber-500/30 animate-pulse'
+                    : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200'
+                }`}
+                title={
+                  pendingApprovalsCount > 0
+                    ? `يوجد ${pendingApprovalsCount} طلب تسجيل جديد قيد الانتظار - انقر للمراجعة والاعتماد`
+                    : 'إدارة طلبات وموافقات المستخدمين'
+                }
+              >
+                <div className="relative flex items-center justify-center">
+                  <Bell className={`w-3.5 h-3.5 sm:w-4 sm:h-4 ${pendingApprovalsCount > 0 ? 'text-slate-950 animate-bounce' : 'text-slate-500'}`} />
+                  {pendingApprovalsCount > 0 && (
+                    <span className="absolute -top-1 -right-1 flex h-2 w-2">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-600 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-rose-600"></span>
+                    </span>
+                  )}
+                </div>
+                <span className="hidden xs:inline">طلبات معلقة</span>
+                {pendingApprovalsCount > 0 ? (
+                  <span className="bg-rose-600 text-white px-1.5 py-0.2 rounded-full text-[10px] sm:text-[11px] font-black">
+                    {pendingApprovalsCount}
+                  </span>
+                ) : (
+                  <span className="text-[10px] text-slate-500 font-semibold">(0)</span>
+                )}
+              </button>
             )}
 
             {/* Share link button */}
@@ -284,6 +316,27 @@ export const Header: React.FC<HeaderProps> = ({
           <span>التقارير المالية والمبيعات</span>
         </button>
 
+        {onOpenApprovals && (
+          <button
+            id="tab-header-user-approvals"
+            type="button"
+            onClick={onOpenApprovals}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition shrink-0 cursor-pointer whitespace-nowrap ${
+              pendingApprovalsCount > 0
+                ? 'bg-amber-500 text-slate-950 font-black shadow-xs ring-2 ring-amber-400/50'
+                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/70'
+            }`}
+          >
+            <ShieldCheck className={`w-3.5 h-3.5 shrink-0 ${pendingApprovalsCount > 0 ? 'text-slate-950' : 'text-slate-500'}`} />
+            <span>تصاريح وموافقات المستخدمين</span>
+            {pendingApprovalsCount > 0 && (
+              <span className="bg-rose-600 text-white text-[10px] font-black px-1.5 py-0.2 rounded-full animate-pulse">
+                {pendingApprovalsCount}
+              </span>
+            )}
+          </button>
+        )}
+
         <button
           onClick={() => onSelectView('pharmacy')}
           className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition shrink-0 cursor-pointer whitespace-nowrap ${
@@ -300,21 +353,6 @@ export const Header: React.FC<HeaderProps> = ({
             </span>
           )}
         </button>
-
-        {(currentUser?.role === 'owner' || currentUser?.role === 'super_admin' || currentUser?.founder || currentUser?.role === 'warehouse_manager') && onOpenApprovals && (
-          <button
-            onClick={onOpenApprovals}
-            className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition shrink-0 cursor-pointer whitespace-nowrap text-amber-900 bg-amber-100/80 hover:bg-amber-200/80 border border-amber-300"
-          >
-            <ShieldCheck className="w-3.5 h-3.5 text-amber-700 shrink-0" />
-            <span>تصاريح الموافقات</span>
-            {pendingApprovalsCount > 0 && (
-              <span className="bg-amber-500 text-slate-950 text-[10px] font-black px-1.5 py-0.2 rounded-full">
-                {pendingApprovalsCount}
-              </span>
-            )}
-          </button>
-        )}
       </nav>
     </header>
   );

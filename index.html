@@ -19,25 +19,58 @@
     <link rel="manifest" href="/manifest.json" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800;900&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <script src="https://accounts.google.com/gsi/client" async defer></script>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800;900&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
+    <noscript>
+      <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800;900&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap">
+    </noscript>
   </head>
   <body class="bg-slate-50 text-slate-900 antialiased selection:bg-blue-600 selection:text-white w-full max-w-full overflow-x-hidden">
     <div id="root">
-      <div style="min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background-color: #0f172a; font-family: 'Cairo', system-ui, sans-serif; color: #f8fafc; direction: rtl;">
-        <div style="position: relative; width: 64px; height: 64px; margin-bottom: 20px;">
-          <div style="box-sizing: border-box; width: 64px; height: 64px; border: 4px solid rgba(59, 130, 246, 0.2); border-top-color: #3b82f6; border-radius: 50%; animation: samo-spin 0.8s linear infinite;"></div>
+      <div id="initial-loader" style="min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background-color: #f8fafc; font-family: 'Cairo', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #0f172a; direction: rtl; padding: 20px; box-sizing: border-box; text-align: center;">
+        <div style="position: relative; width: 56px; height: 56px; margin-bottom: 16px;">
+          <div style="box-sizing: border-box; width: 56px; height: 56px; border: 4px solid rgba(37, 99, 235, 0.15); border-top-color: #2563eb; border-radius: 50%; animation: samo-spin 0.8s linear infinite;"></div>
         </div>
-        <h2 style="font-size: 20px; font-weight: 800; margin: 0 0 8px 0; color: #ffffff; letter-spacing: -0.5px;">مذخر سامو</h2>
-        <p style="font-size: 13px; color: #94a3b8; margin: 0;">جاري تحميل نظام الإدارة والمخزون...</p>
+        <h2 style="font-size: 20px; font-weight: 800; margin: 0 0 6px 0; color: #0f172a; letter-spacing: -0.5px;">مذخر سامو للأدوية</h2>
+        <p style="font-size: 13px; color: #64748b; margin: 0 0 16px 0; font-weight: 500;">جاري تحميل لوحة التحكم والمخزون...</p>
+        <div id="loader-delayed-actions" style="display: none; flex-direction: column; align-items: center; gap: 8px;">
+          <button type="button" onclick="window.location.reload()" style="padding: 8px 18px; background-color: #2563eb; color: #ffffff; border: none; border-radius: 10px; font-family: inherit; font-size: 12px; font-weight: bold; cursor: pointer; box-shadow: 0 2px 4px rgba(0,0,0,0.08);">
+            تحديث الصفحة الآن
+          </button>
+          <button type="button" onclick="try{localStorage.clear();sessionStorage.clear();}catch(e){}window.location.reload();" style="background: none; border: none; color: #64748b; font-family: inherit; font-size: 11px; text-decoration: underline; cursor: pointer; padding: 4px;">
+            مسح البيانات المؤقتة وإعادة التشغيل
+          </button>
+        </div>
         <style>
           @keyframes samo-spin {
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
           }
         </style>
+        <script>
+          setTimeout(function() {
+            var actions = document.getElementById('loader-delayed-actions');
+            if (actions) actions.style.display = 'flex';
+          }, 2500);
+        </script>
       </div>
     </div>
+    <div id="runtime-error-box" style="display: none; position: fixed; inset: 0; z-index: 99999; background-color: #f8fafc; padding: 24px; font-family: 'Cairo', system-ui, sans-serif; direction: rtl; text-align: center; box-sizing: border-box; justify-content: center; align-items: center;">
+      <div style="max-width: 480px; width: 100%; background: #ffffff; padding: 28px; border-radius: 24px; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1); border: 1px solid #e2e8f0; margin: auto;">
+        <h3 style="color: #0f172a; margin-top: 0; font-size: 18px; font-weight: 800;">مذخر سامو للأدوية</h3>
+        <p style="color: #64748b; font-size: 13px; margin: 8px 0 16px;">حدث تنبيه أثناء بدء التطبيق، يمكنك استعادة الصفحة فوراً:</p>
+        <button type="button" onclick="try{localStorage.clear();sessionStorage.clear();}catch(e){}window.location.reload();" style="width: 100%; padding: 12px; background: #2563eb; color: #ffffff; border: none; border-radius: 12px; font-weight: 700; font-size: 14px; cursor: pointer;">
+          إعادة التشغيل والدخول للوحة التحكم
+        </button>
+      </div>
+    </div>
+    <script>
+      window.addEventListener('error', function(e) {
+        var box = document.getElementById('runtime-error-box');
+        if (box && !document.querySelector('#root > *:not(#initial-loader)')) {
+          box.style.display = 'flex';
+        }
+      });
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

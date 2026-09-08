@@ -27,6 +27,7 @@ export interface Product {
   bonusDescription?: string;
   image?: string;
   description?: string;
+  genericName?: string;
   isAvailable: boolean;
   updatedAt?: string;
 }
@@ -41,8 +42,10 @@ export interface CartItem {
   product: Product;
   quantity: number;
   bonusQuantity: number;
+  bonusPercentage?: number;
   unitPrice: number;
   meltedPrice?: number;
+  meltedUnitPrice?: number;
   isBonusMelted?: boolean;
   subtotal: number;
 }
@@ -82,6 +85,7 @@ export interface Order {
   phone: string;
   address: string;
   city?: string;
+  currency?: string;
   notes?: string;
   items: OrderItem[];
   totalQuantity: number;
@@ -92,8 +96,30 @@ export interface Order {
   preparedAt?: string;
   preparedBy?: string;
   completedAt?: string;
-  source: 'online_link' | 'offline_cart' | 'direct';
+  source: 'online_link' | 'offline_cart' | 'direct' | 'link';
   synced: boolean;
+  editedAt?: string;
+  editedBy?: string;
+  editReason?: string;
+  lastUpdatedAt?: string;
+}
+
+export interface WarehouseOperation {
+  id: string;
+  type: 'order_created' | 'order_prepared' | 'order_verified' | 'order_delivered' | 'order_rejected' | 'order_edited' | 'order_deleted' | 'status_changed';
+  orderId: string;
+  orderNumber: string;
+  pharmacyName: string;
+  performedBy: string;
+  timestamp: string;
+  actionTitle?: string;
+  details?: string;
+  status?: OrderStatus;
+  targetStatus?: OrderStatus;
+  itemsCount?: number;
+  totalQuantity?: number;
+  totalAmount?: number;
+  items?: OrderItem[];
 }
 
 export interface WarehouseSettings {
@@ -136,15 +162,32 @@ export interface RegisteredPharmacy {
   lastOrderDate?: string;
 }
 
-export type UserAccessStatus = 'pending' | 'approved' | 'rejected' | 'deactivated';
+export interface UserPharmacyBranch {
+  id: string;
+  name: string; // اسم الصيدلية (الفرع)
+  pharmacistName?: string; // اسم الموظف / الصيدلي المسؤول
+  phone: string; // نفس رقم الهاتف
+  address: string; // عنوان الصيدلية
+  city?: string;
+  notes?: string;
+  createdAt?: string;
+  isDefault?: boolean;
+}
+
+export type UserAccessStatus = 'pending' | 'approved' | 'rejected' | 'deactivated' | 'blocked' | 'deleted';
 
 export type UserRole = 
+  | 'founder'
+  | 'staff'
+  | 'warehouse'
+  | 'pharmacy'
+  | 'pending'
   | 'super_admin'
   | 'warehouse_manager'
   | 'pharmacist_staff'
   | 'auditor_readonly'
-  | 'owner'     // legacy alias for super_admin / warehouse owner
-  | 'pharmacy'; // legacy alias for pharmacist_staff
+  | 'owner'
+  | 'rejected';
 
 // Permanent super admin emails with bootstrap master access
 export const SUPER_ADMIN_EMAILS: string[] = [
@@ -160,6 +203,29 @@ export function isSuperAdminEmail(email?: string): boolean {
 
 export type RegistrationAccountType = 'warehouse_staff' | 'pharmacy';
 
+export interface AuthorizationRequestMessage {
+  id: string;
+  requestId: string; // e.g. REQ-73821
+  userId: string;
+  type: 'login_request' | 'new_registration';
+  userName: string;
+  pharmacyName: string;
+  identifier: string; // phone or email
+  phone?: string;
+  email?: string;
+  role: UserRole;
+  requestedRole: UserRole;
+  registrationAccountType?: RegistrationAccountType;
+  address?: string;
+  notes?: string;
+  status: UserAccessStatus;
+  createdAt: string;
+  approvedAt?: string;
+  approvedBy?: string;
+  reviewedBy?: string;
+  rejectionReason?: string;
+}
+
 export interface AppUser {
   id: string;
   role: UserRole;
@@ -168,8 +234,12 @@ export interface AppUser {
   identifier: string; // phone or email
   name: string; // User or Pharmacist full name
   pharmacyName: string; // Facility/Pharmacy or Warehouse Dept
+  pharmacistName?: string;
+  syndicateNumber?: string; // رقم نقابة الصيادلة
+  profileCompleted?: boolean;
   phone?: string;
   email?: string;
+  password?: string;
   address?: string;
   status: UserAccessStatus;
   createdAt: string;
@@ -180,8 +250,11 @@ export interface AppUser {
   passcodeVersion?: number;
   founder?: boolean;
   avatarUrl?: string;
-  authProvider?: 'google' | 'phone_pin' | 'local';
+  authProvider?: 'google' | 'phone_pin' | 'local' | 'form' | 'passcode';
   googleId?: string;
+  requestId?: string;
+  pharmacies?: UserPharmacyBranch[];
+  activePharmacyId?: string;
 }
 
 // Product Batch tracking for FEFO (First Expired, First Out)

@@ -1,24 +1,24 @@
 import React, { useState, useEffect } from 'react';
 import { 
   Clock, 
-  CheckCircle2, 
+  ShieldCheck, 
   RefreshCw, 
   LogOut, 
-  MapPin, 
+  Mail, 
   User, 
-  Store, 
-  Building2, 
-  Phone, 
-  ShieldCheck,
+  AlertCircle,
+  Building2,
+  Phone,
   Sparkles,
-  MessageCircle
+  CheckCircle2
 } from 'lucide-react';
 import { AppUser, WarehouseSettings } from '../types';
+import { subscribeToUser, signOutFirebase } from '../services/firebase';
 import { storage } from '../services/storage';
 
 interface PendingApprovalScreenProps {
   user: AppUser;
-  settings: WarehouseSettings;
+  settings?: WarehouseSettings;
   onApproved: (updatedUser: AppUser) => void;
   onLogout: () => void;
 }
@@ -30,236 +30,237 @@ export const PendingApprovalScreen: React.FC<PendingApprovalScreenProps> = ({
   onLogout,
 }) => {
   const [isChecking, setIsChecking] = useState(false);
-  const [lastCheckTime, setLastCheckTime] = useState<string>('');
-  const [checkMessage, setCheckMessage] = useState<string>('');
+  const [statusNote, setStatusNote] = useState<string>('');
 
-  const isPharmacy = user.registrationAccountType === 'pharmacy' || user.role === 'pharmacy' || Boolean(user.pharmacyName && user.pharmacyName !== 'مذخر سامو للأدوية');
+  // Real-time synchronization: Firestore + SSE + Polling for instant seamless transition
+  useEffect(() => {
+    let isMounted = true;
 
-  // Manual Check Handler
-  const handleCheckStatus = async () => {
-    setIsChecking(true);
-    setCheckMessage('');
+    const handleApprovalTransition = (approvedUser: AppUser) => {
+      if (!isMounted) return;
+      const finalUser: AppUser = {
+        ...user,
+        ...approvedUser,
+        status: 'approved',
+        role: approvedUser.role && approvedUser.role !== 'pending' ? approvedUser.role : 'pharmacy',
+      };
+      storage.setCurrentUser(finalUser);
+      onApproved(finalUser);
+    };
+
+    // 1. Firestore live document listener
+    let unsubscribeFirestore = () => {};
+    if (user?.id) {
+      unsubscribeFirestore = subscribeToUser(user.id, (liveUser) => {
+        if (!liveUser) return;
+        if (liveUser.status === 'approved') {
+          handleApprovalTransition(liveUser);
+        }
+      });
+    }
+
+    // 2. Server-Sent Events (SSE) listener
+    let eventSource: EventSource | null = null;
     try {
-      const cleanId = user.identifier || user.phone || user.email || '';
-      const res = await fetch(`/api/auth/status?identifier=${encodeURIComponent(cleanId)}`);
-      const data = await res.json();
+      eventSource = new EventSource('/api/events');
+      const handleSseMessage = (e: MessageEvent) => {
+        try {
+          const payload = JSON.parse(e.data);
+          const target = payload.data || payload;
+          if (
+            (target.id && user.id && target.id === user.id) ||
+            (target.identifier && user.identifier && target.identifier.toLowerCase() === user.identifier.toLowerCase()) ||
+            (target.email && user.email && target.email.toLowerCase() === user.email.toLowerCase())
+          ) {
+            if (target.status === 'approved' || (target.role && target.role !== 'pending')) {
+              handleApprovalTransition(target);
+            }
+          }
+        } catch {}
+      };
 
-      if (data.found && data.user) {
-        if (data.user.status === 'approved') {
-          setCheckMessage('تهانينا! تمت الموافقة على حسابك بنجاح. جاري الدخول...');
-          setTimeout(() => {
-            onApproved(data.user);
-          }, 800);
-          return;
-        } else if (data.user.status === 'rejected' || data.user.status === 'deactivated') {
-          setCheckMessage('تم رفض أو إلغاء تفعيل هذا الطلب من قبل الإدارة.');
-        } else {
-          setCheckMessage('طلبك لا يزال قيد الانتظار والمراجعة من قبل المشرف العام.');
+      eventSource.addEventListener('user_approved', handleSseMessage);
+      eventSource.addEventListener('user_updated', handleSseMessage);
+    } catch {}
+
+    // 3. Fast status check poll every 2.5 seconds
+    const pollInterval = setInterval(async () => {
+      try {
+        const queryParams = new URLSearchParams();
+        if (user.id) queryParams.set('id', user.id);
+        if (user.identifier) queryParams.set('identifier', user.identifier);
+        if (user.email) queryParams.set('email', user.email);
+
+        const res = await fetch(`/api/auth/status?${queryParams.toString()}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.found && data.user && data.user.status === 'approved') {
+            handleApprovalTransition(data.user);
+          }
         }
-      } else {
-        // Check local storage registered users
-        const localUsers = storage.getRegisteredUsers();
-        const found = localUsers.find(
-          (u) =>
-            u.id === user.id ||
-            u.identifier.toLowerCase() === cleanId.toLowerCase() ||
-            (u.phone && cleanId && u.phone.replace(/[^0-9]/g, '') === cleanId.replace(/[^0-9]/g, ''))
-        );
-        if (found && found.status === 'approved') {
-          setCheckMessage('تمت الموافقة بنجاح! جاري تحويلك...');
-          setTimeout(() => {
-            onApproved(found);
-          }, 800);
-          return;
-        }
-        setCheckMessage('طلبك لا يزال قيد الانتظار والمراجعة.');
+      } catch {}
+    }, 2500);
+
+    return () => {
+      isMounted = false;
+      unsubscribeFirestore();
+      if (eventSource) {
+        eventSource.close();
       }
+      clearInterval(pollInterval);
+    };
+  }, [user, onApproved]);
+
+  const handleManualRefresh = async () => {
+    setIsChecking(true);
+    setStatusNote('جاري فحص حالة الحساب في الخادم المركزي وقاعدة البيانات...');
+    try {
+      const queryParams = new URLSearchParams();
+      if (user.id) queryParams.set('id', user.id);
+      if (user.identifier) queryParams.set('identifier', user.identifier);
+      if (user.email) queryParams.set('email', user.email);
+
+      const res = await fetch(`/api/auth/status?${queryParams.toString()}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.found && data.user && data.user.status === 'approved') {
+          const finalUser: AppUser = {
+            ...user,
+            ...data.user,
+            status: 'approved',
+            role: data.user.role && data.user.role !== 'pending' ? data.user.role : 'pharmacy',
+          };
+          storage.setCurrentUser(finalUser);
+          onApproved(finalUser);
+          return;
+        }
+      }
+      setStatusNote('الحساب لا يزال قيد التدقيق والمراجعة من قبل إدارة المذخر. سيتم فتح واجهة الصيدلية تلقائياً فور اعتمادك.');
     } catch {
-      setCheckMessage('تعذر التحقق من الخادم، يرجى المحاولة بعد قليل.');
+      setStatusNote('تعذر الاتصال بالخادم حالياً. يرجى المحاولة بعد لحظات.');
     } finally {
       setIsChecking(false);
-      setLastCheckTime(new Date().toLocaleTimeString('ar-IQ'));
     }
   };
 
-  // Real-time SSE listener for instant unlock when admin clicks "موافقة"
-  useEffect(() => {
-    let es: EventSource | null = null;
+  const handleSignOut = async () => {
     try {
-      es = new EventSource('/api/events');
-      
-      es.addEventListener('user_approved', (e: MessageEvent) => {
-        try {
-          const approvedUser = JSON.parse(e.data) as AppUser;
-          const currentIdentifier = (user.identifier || user.phone || user.email || '').toLowerCase();
-          const targetIdentifier = (approvedUser.identifier || approvedUser.phone || approvedUser.email || '').toLowerCase();
-          
-          if (
-            approvedUser.id === user.id ||
-            (currentIdentifier && targetIdentifier && currentIdentifier === targetIdentifier)
-          ) {
-            onApproved(approvedUser);
-          }
-        } catch (err) {
-          console.error('Error handling approval SSE:', err);
-        }
-      });
-    } catch {
-      // ignore
-    }
-
-    // Periodic check every 8 seconds as a reliable background fallback
-    const interval = setInterval(() => {
-      handleCheckStatus();
-    }, 8000);
-
-    return () => {
-      es?.close();
-      clearInterval(interval);
-    };
-  }, [user]);
+      await signOutFirebase();
+    } catch {}
+    storage.setCurrentUser(null);
+    onLogout();
+  };
 
   return (
-    <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-4 selection:bg-blue-600 selection:text-white" dir="rtl">
-      <div className="w-full max-w-lg bg-white rounded-3xl shadow-2xl border border-slate-200 overflow-hidden animate-in fade-in zoom-in-95 duration-200">
-        
-        {/* Top Header Card */}
-        <div className="bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white p-6 sm:p-7 text-center relative">
-          <div className="relative inline-block mb-3">
-            <div className="w-16 h-16 bg-amber-500/20 border-2 border-amber-400 rounded-3xl mx-auto flex items-center justify-center text-amber-400 shadow-lg shadow-amber-500/20 animate-pulse">
-              <Clock className="w-8 h-8 shrink-0" />
-            </div>
-            <div className="absolute -bottom-1 -right-1 w-6 h-6 bg-amber-500 text-white rounded-full flex items-center justify-center text-xs font-bold ring-4 ring-slate-900">
-              ⏳
-            </div>
-          </div>
+    <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4 relative overflow-hidden select-none">
+      {/* Soft background glow */}
+      <div className="absolute -top-40 -right-40 w-96 h-96 bg-blue-600/5 rounded-full blur-3xl pointer-events-none" />
+      <div className="absolute -bottom-40 -left-40 w-96 h-96 bg-amber-500/5 rounded-full blur-3xl pointer-events-none" />
 
-          <h2 className="text-xl sm:text-2xl font-black text-white tracking-tight">
-            طلبك قيد المراجعة والاعتماد
+      <div className="max-w-md w-full bg-white border border-slate-200/90 rounded-3xl p-6 sm:p-8 text-center space-y-6 shadow-xl relative z-10">
+        {/* Animated Status Icon */}
+        <div className="relative mx-auto w-20 h-20">
+          <div className="w-20 h-20 rounded-3xl bg-amber-50 text-amber-600 border border-amber-200 flex items-center justify-center shadow-sm shadow-amber-500/10">
+            <Clock className="w-10 h-10 animate-pulse" />
+          </div>
+          <div className="absolute -top-1 -right-1 w-5 h-5 bg-amber-500 rounded-full flex items-center justify-center text-white ring-4 ring-white">
+            <span className="w-2 h-2 rounded-full bg-white animate-ping"></span>
+          </div>
+        </div>
+
+        {/* Title & Description */}
+        <div className="space-y-2">
+          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 text-amber-700 text-xs font-bold border border-amber-200">
+            <ShieldCheck className="w-3.5 h-3.5" />
+            <span>طلب الحساب مسجل وقيد المراجعة</span>
+          </div>
+          <h2 className="text-xl font-black text-slate-900 tracking-tight">
+            حسابك قيد التدقيق والموافقة
           </h2>
-          <p className="text-xs sm:text-sm text-slate-300 mt-2 leading-relaxed max-w-sm mx-auto">
-            تم استلام بيانات تسجيلك بنجاح، وحسابك بانتظار موافقة المشرف العام لمذخر سامو
-            <span className="text-amber-300 font-bold block mt-0.5">(محمد جعفر الكعبي)</span>
+          <p className="text-xs text-slate-600 leading-relaxed max-w-sm mx-auto">
+            مرحباً بك! تم حفظ طلبك بنجاح في نظام مذخر سامو، وهو الآن قيد التدقيق والاعتماد الأمني من قِبل إدارة المذخر المركزية.
           </p>
         </div>
 
-        {/* Request Details Card */}
-        <div className="p-5 sm:p-6 space-y-4">
-          
-          {/* Account Category Banner */}
-          <div className={`p-3.5 rounded-2xl border flex items-center gap-3 ${
-            isPharmacy 
-              ? 'bg-blue-50/70 border-blue-200 text-blue-950' 
-              : 'bg-amber-50/70 border-amber-200 text-amber-950'
-          }`}>
-            <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
-              isPharmacy ? 'bg-blue-600 text-white' : 'bg-amber-500 text-white'
-            }`}>
-              {isPharmacy ? <Store className="w-5 h-5" /> : <Building2 className="w-5 h-5" />}
-            </div>
+        {/* User Card */}
+        <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 text-right space-y-2.5">
+          <div className="flex items-center gap-3">
+            {user.avatarUrl ? (
+              <img
+                src={user.avatarUrl}
+                alt={user.name}
+                className="w-11 h-11 rounded-xl object-cover border border-slate-200 shrink-0"
+                referrerPolicy="no-referrer"
+              />
+            ) : (
+              <div className="w-11 h-11 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center font-bold text-sm shrink-0 border border-blue-200">
+                {user.name ? user.name.charAt(0) : 'U'}
+              </div>
+            )}
             <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-black">
-                  {isPharmacy ? 'نوع الحساب: حساب صيدلية' : 'نوع الحساب: حساب موظف مذخر'}
-                </span>
-                <span className="text-[10px] bg-amber-200 text-amber-900 font-bold px-2 py-0.5 rounded-full">
-                  قيد الانتظار
-                </span>
+              <div className="text-sm font-bold text-slate-900 truncate">{user.pharmacyName || user.name || 'حساب صيدلية مسجل'}</div>
+              <div className="text-xs text-slate-500 flex items-center gap-1 mt-0.5 truncate">
+                {user.phone ? (
+                  <>
+                    <Phone className="w-3 h-3 text-slate-400 shrink-0" />
+                    <span dir="ltr" className="truncate">{user.phone}</span>
+                  </>
+                ) : (
+                  <>
+                    <Mail className="w-3 h-3 text-slate-400 shrink-0" />
+                    <span dir="ltr" className="truncate">{user.email || user.identifier}</span>
+                  </>
+                )}
               </div>
-              <p className="text-[11px] text-slate-600 truncate mt-0.5">
-                {isPharmacy 
-                  ? 'طلب مصادقة للوصول إلى كتالوج الأدوية وطلب المواد مباشرة' 
-                  : 'طلب مصادقة للوصول إلى لوحة إدارة المذخر وتجهيز الطلبيات'}
-              </p>
             </div>
           </div>
 
-          {/* Submitted Information Box */}
-          <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-2.5 text-xs text-slate-700">
-            <h4 className="font-black text-slate-900 text-xs border-b border-slate-200 pb-2 flex items-center gap-1.5">
-              <User className="w-4 h-4 text-slate-500" />
-              <span>البيانات المقدمة في الطلب:</span>
-            </h4>
-
-            {isPharmacy && user.pharmacyName && (
-              <div className="flex items-center justify-between py-1 border-b border-slate-200/60">
-                <span className="text-slate-500">اسم الصيدلية:</span>
-                <strong className="text-blue-700 font-black">{user.pharmacyName}</strong>
-              </div>
-            )}
-
-            {isPharmacy && user.address && (
-              <div className="flex items-start justify-between py-1 border-b border-slate-200/60 gap-3">
-                <span className="text-slate-500 shrink-0">عنوان الصيدلية:</span>
-                <span className="font-medium text-slate-900 text-left" dir="auto">{user.address}</span>
-              </div>
-            )}
-
-            <div className="flex items-center justify-between py-1 border-b border-slate-200/60">
-              <span className="text-slate-500">{isPharmacy ? 'اسم الصيدلاني / المسؤول:' : 'اسم موظف المذخر:'}</span>
-              <strong className="text-slate-900">{user.name}</strong>
-            </div>
-
-            <div className="flex items-center justify-between py-1">
-              <span className="text-slate-500">رقم الهاتف المسجل:</span>
-              <span className="font-mono font-bold text-slate-900 bg-white px-2 py-0.5 rounded border border-slate-300" dir="ltr">
-                {user.phone || user.identifier}
-              </span>
-            </div>
+          <div className="pt-2 border-t border-slate-200 flex items-center justify-between text-[11px] text-slate-600">
+            <span>الحالة الحالية:</span>
+            <span className="px-2 py-0.5 rounded-md bg-amber-100 text-amber-800 font-bold border border-amber-200">
+              قيد الانتظار (Pending)
+            </span>
           </div>
+        </div>
 
-          {/* Feedback or Notification message */}
-          {checkMessage && (
-            <div className="p-3 rounded-xl bg-blue-50 border border-blue-200 text-blue-800 text-xs font-semibold flex items-center gap-2">
-              <Sparkles className="w-4 h-4 text-blue-600 shrink-0" />
-              <span>{checkMessage}</span>
-            </div>
-          )}
-
-          {/* Action Buttons */}
-          <div className="space-y-2 pt-2">
-            <button
-              type="button"
-              onClick={handleCheckStatus}
-              disabled={isChecking}
-              className="w-full py-3 bg-blue-600 hover:bg-blue-700 active:scale-98 text-white text-xs font-black rounded-xl shadow-md transition cursor-pointer flex items-center justify-center gap-2 disabled:opacity-60"
-            >
-              <RefreshCw className={`w-4 h-4 ${isChecking ? 'animate-spin' : ''}`} />
-              <span>{isChecking ? 'جاري التحقق من الموافقة...' : 'التحقق من حالة الموافقة الآن 🔄'}</span>
-            </button>
-
-            {/* WhatsApp Contact with Management */}
-            {settings.phone && (
-              <a
-                href={`https://api.whatsapp.com/send?phone=${settings.phone.replace(/[^0-9]/g, '')}&text=${encodeURIComponent(
-                  `السلام عليكم، قمت بتسجيل طلب حساب جديد في مذخر سامو باسم: ${user.name} (${user.pharmacyName || 'موظف مذخر'}). يرجى الموافقة على الحساب وشكراً.`
-                )}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="w-full py-2.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-xl text-xs font-bold transition flex items-center justify-center gap-2"
-              >
-                <MessageCircle className="w-4 h-4 text-emerald-600" />
-                <span>إشعار الإدارة عبر الواتساب لتسريع التفعيل</span>
-              </a>
-            )}
-
-            {/* Logout button to re-register or use another account */}
-            <button
-              type="button"
-              onClick={onLogout}
-              className="w-full py-2 text-slate-500 hover:text-slate-800 text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer pt-2"
-            >
-              <LogOut className="w-3.5 h-3.5" />
-              <span>تسجيل الخروج أو التسجيل بحساب آخر</span>
-            </button>
+        {/* Real-time sync note */}
+        <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl text-right">
+          <div className="flex items-start gap-2.5 text-xs text-emerald-800 leading-relaxed font-medium">
+            <Sparkles className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+            <span>
+              تم حفظ تسجيل دخولك على هذا الجهاز. بمجرد موافقة إدارة المذخر، ستفتح لك بوابة الصيدلية فوراً ومباشرة من الرابط دون الحاجة لإعادة تسجيل الدخول!
+            </span>
           </div>
+        </div>
 
-          {lastCheckTime && (
-            <p className="text-[10px] text-center text-slate-400">
-              آخر فحص تلقائي للحالة: {lastCheckTime} • يتم التحديث اللحظي فور قيام الإدارة بالموافقة.
-            </p>
-          )}
+        {statusNote && (
+          <div className="text-xs text-slate-700 bg-slate-100 p-2.5 rounded-xl border border-slate-200 animate-fadeIn">
+            {statusNote}
+          </div>
+        )}
 
+        {/* Controls */}
+        <div className="pt-2 flex flex-col sm:flex-row items-center gap-2.5">
+          <button
+            id="btn-check-pending-status"
+            type="button"
+            disabled={isChecking}
+            onClick={handleManualRefresh}
+            className="w-full sm:flex-1 py-3 px-4 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition cursor-pointer flex items-center justify-center gap-2 active:scale-95 disabled:opacity-50 shadow-sm"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isChecking ? 'animate-spin' : ''}`} />
+            <span>تحديث حالة الموافقة</span>
+          </button>
+
+          <button
+            id="btn-pending-logout"
+            type="button"
+            onClick={handleSignOut}
+            className="w-full sm:w-auto py-3 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition cursor-pointer flex items-center justify-center gap-1.5 active:scale-95 border border-slate-200"
+          >
+            <LogOut className="w-3.5 h-3.5" />
+            <span>تسجيل الخروج</span>
+          </button>
         </div>
       </div>
     </div>

@@ -1,22 +1,43 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Product, Order, OrderStatus, CartItem, WarehouseSettings, calculateMeltedPrice, AppUser } from './types';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { Product, Order, OrderStatus, CartItem, WarehouseSettings, calculateMeltedPrice, AppUser, WarehouseOperation } from './types';
 import { storage } from './services/storage';
 import { playNewOrderChime, playSuccessChime, playWarningAlertChime } from './services/sound';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { Header } from './components/Header';
-import { PharmacyPortal } from './components/PharmacyPortal';
-import { WarehouseDashboard } from './components/WarehouseDashboard';
-import { InventoryManager, InventoryFilterType } from './components/InventoryManager';
-import { AddMaterialsPage } from './components/AddMaterialsPage';
-import { FinancialReportsPage } from './components/FinancialReportsPage';
-import { ShareLinkModal } from './components/ShareLinkModal';
 import { AuthModal } from './components/AuthModal';
-import { UserApprovalsModal } from './components/UserApprovalsModal';
 import { PendingApprovalScreen } from './components/PendingApprovalScreen';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { computeInventoryAlerts } from './services/alertService';
-import { initialProducts, initialOrders } from './data/initialProducts';
-import { LayoutDashboard, Boxes, Receipt, Share2, ShoppingBag, Pill, ShieldCheck, UserCheck, PlusCircle, DollarSign, BarChart3, TrendingUp, Menu, X, LogOut, AlertCircle, ArrowRight, Bell } from 'lucide-react';
+import type { InventoryFilterType } from './components/InventoryManager';
+import { WarehouseDashboard } from './components/WarehouseDashboard';
+import { PharmacyPortal } from './components/PharmacyPortal';
+import { 
+  db,
+  subscribeToUser, 
+  subscribeToAllUsers, 
+  subscribeToAllOrders,
+  saveOrderToFirestore,
+  deleteOrderFromFirestore,
+  deleteOrdersFromFirestore,
+  logWarehouseOperation,
+  subscribeToWarehouseOperations,
+  signOutFirebase 
+} from './services/firebase';
+import { LayoutDashboard, Boxes, Receipt, Share2, ShoppingBag, Pill, ShieldCheck, UserCheck, PlusCircle, DollarSign, BarChart3, TrendingUp, Menu, X, LogOut, AlertCircle, ArrowRight, Bell, CheckCircle, XCircle, FileText, PackageCheck } from 'lucide-react';
+
+import { InventoryManager } from './components/InventoryManager';
+import { AddMaterialsPage } from './components/AddMaterialsPage';
+import { FinancialReportsPage } from './components/FinancialReportsPage';
+import { ShareLinkModal } from './components/ShareLinkModal';
+import { UserApprovalsModal } from './components/UserApprovalsModal';
+import { PharmacyOnboardingModal } from './components/PharmacyOnboardingModal';
+
+const ViewLoader = () => (
+  <div className="flex flex-col items-center justify-center min-h-[350px] py-16 text-slate-500" dir="rtl">
+    <div className="w-10 h-10 border-4 border-blue-600/20 border-t-blue-600 rounded-full animate-spin mb-4" />
+    <span className="text-sm font-bold text-slate-700">جاري تحميل الشاشة...</span>
+  </div>
+);
 
 export type AppView = 'warehouse' | 'pharmacy' | 'inventory' | 'add_materials' | 'financial_reports';
 
@@ -28,6 +49,7 @@ export default function App() {
   const [orders, setOrders] = useState<Order[]>(() => storage.getOrders());
   const [settings, setSettings] = useState<WarehouseSettings>(() => storage.getSettings());
   const [cart, setCart] = useState<CartItem[]>([]);
+  const [warehouseInitialTab, setWarehouseInitialTab] = useState<OrderStatus | 'all' | 'pharmacies' | 'approved_dispatched'>('new');
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
 
   // Active view and navigation history - defaults to warehouse dashboard for main system
@@ -118,13 +140,470 @@ export default function App() {
   // Authentication & Access Approvals State
   const [currentUser, setCurrentUser] = useState<AppUser | null>(() => storage.getCurrentUser());
   const [registeredUsers, setRegisteredUsers] = useState<AppUser[]>(() => storage.getRegisteredUsers());
+  const pendingUsers = useMemo(
+    () => registeredUsers.filter((u) => u.status === 'pending' || u.role === 'pending'),
+    [registeredUsers]
+  );
   const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(false);
   const [isApprovalsModalOpen, setIsApprovalsModalOpen] = useState<boolean>(false);
   const [authModalCustomMessage, setAuthModalCustomMessage] = useState<string>('');
   const [newRegistrationAlert, setNewRegistrationAlert] = useState<AppUser | null>(null);
 
+  // Live Operations & Real-time Staff Activity Stream
+  const [operations, setOperations] = useState<WarehouseOperation[]>([]);
+  const [liveOperationAlert, setLiveOperationAlert] = useState<WarehouseOperation | null>(null);
+
+  const knownPendingIdsRef = useRef<Set<string>>(new Set());
+  const isInitialLoadRef = useRef<boolean>(true);
+
+  // Synthesized notification chime for new registration requests
+  const playPendingNotificationChime = useCallback(() => {
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      if (ctx.state === 'suspended') {
+        ctx.resume();
+      }
+      const now = ctx.currentTime;
+      
+      // Tone 1: 587.33 Hz (D5)
+      const osc1 = ctx.createOscillator();
+      const gain1 = ctx.createGain();
+      osc1.type = 'sine';
+      osc1.frequency.setValueAtTime(587.33, now);
+      gain1.gain.setValueAtTime(0.2, now);
+      gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
+      osc1.connect(gain1);
+      gain1.connect(ctx.destination);
+      osc1.start(now);
+      osc1.stop(now + 0.35);
+
+      // Tone 2: 880 Hz (A5)
+      const osc2 = ctx.createOscillator();
+      const gain2 = ctx.createGain();
+      osc2.type = 'sine';
+      osc2.frequency.setValueAtTime(880, now + 0.12);
+      gain2.gain.setValueAtTime(0.25, now + 0.12);
+      gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.55);
+      osc2.connect(gain2);
+      gain2.connect(ctx.destination);
+      osc2.start(now + 0.12);
+      osc2.stop(now + 0.55);
+    } catch (e) {
+      console.warn('Notification chime warning:', e);
+    }
+  }, []);
+
+  const isRealPendingUser = useCallback((u?: AppUser | null): boolean => {
+    if (!u) return false;
+    const id = u.id || '';
+    const email = (u.email || u.identifier || '').toLowerCase().trim();
+    if (email === 'mohammedjafaralkabi@gmail.com' || id === 'user-super-admin-master' || u.founder) return false;
+    if (
+      id === 'user-owner' ||
+      id === 'user-pharma-demo' ||
+      id.startsWith('mock-') ||
+      id.startsWith('demo-') ||
+      email === 'admin@samo.pharma' ||
+      email === 'alishifa@gmail.com'
+    ) {
+      return false;
+    }
+    if (storage.isUserDeleted(u.id, u.identifier, u.pharmacyName)) return false;
+    if (storage.isAlertHandled(u.id, u.identifier, u.phone, u.email)) return false;
+    return u.status === 'pending' || u.role === 'pending';
+  }, []);
+
+  // نظام الإشعار الصوتي والبصري للطلبات المعلقة الحقيقية الجديدة فقط
+  useEffect(() => {
+    if (isInitialLoadRef.current) {
+      pendingUsers.forEach((u) => {
+        knownPendingIdsRef.current.add(u.id);
+        if (u.identifier) knownPendingIdsRef.current.add(u.identifier);
+      });
+      if (registeredUsers.length > 0) {
+        isInitialLoadRef.current = false;
+      }
+    } else {
+      const freshPending = pendingUsers.filter(
+        (u) =>
+          !knownPendingIdsRef.current.has(u.id) &&
+          (!u.identifier || !knownPendingIdsRef.current.has(u.identifier)) &&
+          !storage.isAlertHandled(u.id, u.identifier, u.phone, u.email) &&
+          isRealPendingUser(u)
+      );
+      if (freshPending.length > 0) {
+        const newest = freshPending[0];
+        if (soundEnabled) {
+          playPendingNotificationChime();
+        }
+        setNewRegistrationAlert(newest);
+        freshPending.forEach((u) => {
+          knownPendingIdsRef.current.add(u.id);
+          if (u.identifier) knownPendingIdsRef.current.add(u.identifier);
+        });
+      }
+    }
+  }, [pendingUsers, soundEnabled, playPendingNotificationChime, registeredUsers.length, isRealPendingUser]);
+
   // Compute live alerts for out-of-stock and near-expiry items
   const alerts = useMemo(() => computeInventoryAlerts(products), [products]);
+
+  // Persistent local session bootstrap & live verification
+  useEffect(() => {
+    const user = storage.getCurrentUser();
+    if (user) {
+      const sessionCheck = storage.validateSession(user);
+      if (!sessionCheck.valid) {
+        storage.setCurrentUser(null);
+        setCurrentUser(null);
+        if (sessionCheck.reason === 'deleted') {
+          setAuthModalCustomMessage('تم إنهاء صلاحية وصولك للنظام من قبل إدارة المذخر.');
+        }
+      } else {
+        setCurrentUser(user);
+      }
+    }
+  }, []);
+
+  // Real-time Firestore subscription for the current user's profile updates & immediate ejection if blocked/deleted
+  useEffect(() => {
+    if (!currentUser?.id) return;
+    // Founder / Owner / Passcode users are completely immune to remote ejection
+    if (
+      currentUser.founder ||
+      currentUser.role === 'founder' ||
+      currentUser.id === 'founder_admin' ||
+      currentUser.id === 'user-super-admin-master' ||
+      currentUser.identifier === 'admin2026' ||
+      currentUser.identifier === 'staff2026' ||
+      currentUser.identifier?.toLowerCase() === 'mohammedjafaralkabi@gmail.com' ||
+      (currentUser.email && currentUser.email.toLowerCase() === 'mohammedjafaralkabi@gmail.com')
+    ) {
+      return;
+    }
+
+    const unsubscribe = subscribeToUser(currentUser.id, (liveUser) => {
+      // Immediate ejection ONLY if explicitly deleted or blocked in Firestore
+      if (liveUser && (liveUser.status === 'blocked' || liveUser.status === 'deleted' || liveUser.status === 'rejected')) {
+        storage.setCurrentUser(null);
+        setCurrentUser(null);
+        setAuthModalCustomMessage('تم إنهاء صلاحية وصولك للنظام من قبل إدارة المذخر.');
+        setIsAuthModalOpen(true);
+        return;
+      }
+      if (!liveUser) return;
+
+      setCurrentUser((prev) => {
+        if (!prev) return liveUser;
+        if (
+          prev.role !== liveUser.role ||
+          prev.status !== liveUser.status ||
+          prev.profileCompleted !== liveUser.profileCompleted ||
+          prev.pharmacyName !== liveUser.pharmacyName
+        ) {
+          storage.setCurrentUser(liveUser);
+          return liveUser;
+        }
+        return prev;
+      });
+    });
+    return () => unsubscribe();
+  }, [currentUser?.id, currentUser?.founder, currentUser?.role]);
+
+  // Live synchronization of registered users and approval status from backend server
+  const syncServerUsers = useCallback(async (isInitial = false) => {
+    try {
+      const res = await fetch('/api/auth/users', {
+        headers: { 'Cache-Control': 'no-cache' }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.users)) {
+          const currentRegistered = storage.getRegisteredUsers();
+          const userMap = new Map<string, AppUser>();
+          // Add server users first (server is the single source of truth)
+          data.users.forEach((u: AppUser) => {
+            if (u && !storage.isUserDeleted(u.id, u.identifier, u.pharmacyName)) {
+              const id = u.id || '';
+              const email = (u.email || u.identifier || '').toLowerCase().trim();
+              if (
+                id !== 'user-owner' &&
+                id !== 'user-pharma-demo' &&
+                !id.startsWith('mock-') &&
+                !id.startsWith('demo-') &&
+                email !== 'admin@samo.pharma' &&
+                email !== 'alishifa@gmail.com'
+              ) {
+                userMap.set(u.id, u);
+              }
+            }
+          });
+
+          // Keep any valid user from currentRegistered that is not deleted
+          currentRegistered.forEach((u) => {
+            if (u && !userMap.has(u.id) && !storage.isUserDeleted(u.id, u.identifier, u.pharmacyName)) {
+              userMap.set(u.id, u);
+            }
+          });
+          const merged = Array.from(userMap.values());
+          storage.saveRegisteredUsers(merged);
+          setRegisteredUsers(merged);
+
+          // Check if there is a newly arrived real pending user for notification
+          if (!isInitial) {
+            const prevPendingIds = new Set(currentRegistered.filter((u) => isRealPendingUser(u)).map((u) => u.id));
+            const newlyPending = merged.find(
+              (u) =>
+                isRealPendingUser(u) &&
+                !prevPendingIds.has(u.id) &&
+                !storage.isAlertHandled(u.id, u.identifier, u.phone, u.email)
+            );
+            if (newlyPending) {
+              setNewRegistrationAlert(newlyPending);
+              if (soundEnabled) {
+                playWarningAlertChime();
+              }
+            }
+          }
+
+          // Seamless direct entry check: If currentUser was pending and now approved on server, upgrade
+          const curr = storage.getCurrentUser();
+          if (curr && curr.status !== 'approved') {
+            const serverMatch = merged.find(
+              (u) =>
+                (u.id && u.id === curr.id) ||
+                (u.identifier && curr.identifier && u.identifier.toLowerCase() === curr.identifier.toLowerCase()) ||
+                (u.email && curr.email && u.email.toLowerCase() === curr.email.toLowerCase())
+            );
+            if (serverMatch && serverMatch.status === 'approved') {
+              const updated: AppUser = {
+                ...curr,
+                ...serverMatch,
+                status: 'approved',
+                role: serverMatch.role && serverMatch.role !== 'pending' ? serverMatch.role : (curr.role && curr.role !== 'pending' ? curr.role : 'pharmacy'),
+              };
+              storage.setCurrentUser(updated);
+              setCurrentUser(updated);
+              if (updated.role === 'pharmacy') {
+                setCurrentView('pharmacy');
+              }
+              if (soundEnabled) {
+                playSuccessChime();
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to sync users from server:', err);
+    }
+  }, [soundEnabled, isRealPendingUser, playSuccessChime]);
+
+  // Live synchronization of all orders (incoming, preparing, ready, delivered, and dispatched) across all warehouse accounts & devices
+  const syncServerOrders = useCallback(async (isInitial = false) => {
+    if (!isOnline) return;
+    try {
+      const res = await fetch('/api/orders', {
+        headers: {
+          'Cache-Control': 'no-cache',
+          ...(currentUser?.id ? { 'x-user-id': currentUser.id } : {}),
+          ...(currentUser?.identifier ? { 'x-user-identifier': currentUser.identifier } : {}),
+          ...(currentUser?.role ? { 'x-user-role': currentUser.role } : {}),
+        },
+      });
+
+      if (!res.ok) return;
+
+      const data = await res.json();
+      if (!Array.isArray(data.orders)) return;
+
+      const serverList: Order[] = data.orders;
+
+      setOrders((prevOrders) => {
+        // If server is completely empty but client has local orders, upload to server
+        if (serverList.length === 0 && prevOrders.length > 0) {
+          fetch('/api/sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pendingOrders: prevOrders }),
+          }).catch(() => {});
+          return prevOrders;
+        }
+
+        const orderMap = new Map<string, Order>();
+
+        // 1. Add server orders (server is source of truth across all devices and accounts)
+        serverList.forEach((o) => {
+          if (o && o.id && !storage.isOrderDeleted(o.id)) {
+            orderMap.set(o.id, o);
+          }
+        });
+
+        // 2. Preserve and upload any local-only orders that have not yet reached server
+        prevOrders.forEach((localOrder) => {
+          if (localOrder && localOrder.id && !storage.isOrderDeleted(localOrder.id)) {
+            if (!orderMap.has(localOrder.id)) {
+              orderMap.set(localOrder.id, localOrder);
+              fetch('/api/orders', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ...localOrder, mergePending: false }),
+              }).catch(() => {});
+            } else {
+              // Both have the order: select the more progressed or updated status
+              const serverOrder = orderMap.get(localOrder.id)!;
+              const serverTime = new Date(serverOrder.completedAt || serverOrder.preparedAt || serverOrder.createdAt || 0).getTime();
+              const localTime = new Date(localOrder.completedAt || localOrder.preparedAt || localOrder.createdAt || 0).getTime();
+
+              if (localTime > serverTime) {
+                orderMap.set(localOrder.id, localOrder);
+                fetch(`/api/orders/${localOrder.id}`, {
+                  method: 'PATCH',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(localOrder),
+                }).catch(() => {});
+              }
+            }
+          }
+        });
+
+        const merged = Array.from(orderMap.values()).sort(
+          (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+        );
+
+        // Notify if a brand new unhandled incoming order arrived while logged in
+        if (!isInitial && prevOrders.length > 0) {
+          const prevIdSet = new Set(prevOrders.map((o) => o.id));
+          const newlyArrived = merged.find((o) => !prevIdSet.has(o.id) && o.status === 'new');
+          if (newlyArrived) {
+            setNewOrderAlert(newlyArrived);
+            if (soundEnabled) {
+              playNewOrderChime();
+            }
+          }
+        }
+
+        storage.saveOrders(merged);
+        return merged;
+      });
+    } catch (err) {
+      console.warn('Orders live sync error:', err);
+    }
+  }, [isOnline, soundEnabled, playNewOrderChime]);
+
+  // Real-time Firestore subscription for all users (for Founder and Warehouse management)
+  useEffect(() => {
+    const isFounderOrWarehouse =
+      !currentUser ||
+      currentUser.role === 'founder' ||
+      currentUser.founder ||
+      currentUser.role === 'warehouse' ||
+      currentUser.role === 'owner' ||
+      currentUser.role === 'super_admin' ||
+      currentUser.role === 'warehouse_manager' ||
+      currentUser.role === 'staff' ||
+      currentUser.role === 'pharmacist_staff' ||
+      currentView === 'warehouse';
+
+    if (!isFounderOrWarehouse) return;
+
+    const unsubscribe = subscribeToAllUsers(
+      (liveUsers) => {
+        const clean = liveUsers.filter((u) => {
+          if (!u) return false;
+          const id = u.id || '';
+          const email = (u.email || u.identifier || '').toLowerCase().trim();
+          if (id === 'user-super-admin-master' || email === 'mohammedjafaralkabi@gmail.com' || u.founder) return true;
+          if (
+            id === 'user-owner' ||
+            id === 'user-pharma-demo' ||
+            !id ||
+            id.startsWith('mock-') ||
+            id.startsWith('demo-') ||
+            email === 'admin@samo.pharma' ||
+            email === 'alishifa@gmail.com'
+          ) {
+            return false;
+          }
+          return !storage.isUserDeleted(u.id, u.identifier, u.pharmacyName);
+        });
+        setRegisteredUsers(clean);
+        storage.saveRegisteredUsers(clean);
+      },
+      (error) => {
+        console.info('Firestore all-users subscription notice:', error?.code || error?.message);
+        syncServerUsersRef.current?.(false);
+      }
+    );
+    return () => unsubscribe();
+  }, [currentUser?.id, currentUser?.role, currentUser?.founder, currentView]);
+
+  // Real-time Firestore live subscription for all orders across all warehouse employees & accounts
+  useEffect(() => {
+    const unsubOrders = subscribeToAllOrders(
+      (firestoreOrders) => {
+        if (!firestoreOrders || firestoreOrders.length === 0) return;
+        setOrders((prevOrders) => {
+          const orderMap = new Map<string, Order>();
+          // 1. Add firestore orders (authoritative cloud sync)
+          firestoreOrders.forEach((o) => {
+            if (o && o.id && !storage.isOrderDeleted(o.id)) {
+              orderMap.set(o.id, o);
+            }
+          });
+
+          // 2. Preserve any local-only orders that have not yet reached Firestore or have newer local preparation status
+          prevOrders.forEach((localOrder) => {
+            if (localOrder && localOrder.id && !storage.isOrderDeleted(localOrder.id)) {
+              if (!orderMap.has(localOrder.id)) {
+                orderMap.set(localOrder.id, localOrder);
+                saveOrderToFirestore(localOrder).catch(() => {});
+              } else {
+                const cloudOrder = orderMap.get(localOrder.id)!;
+                const cloudTime = new Date(cloudOrder.completedAt || cloudOrder.preparedAt || (cloudOrder as any).lastUpdatedAt || cloudOrder.createdAt || 0).getTime();
+                const localTime = new Date(localOrder.completedAt || localOrder.preparedAt || (localOrder as any).lastUpdatedAt || localOrder.createdAt || 0).getTime();
+                // If local order has more advanced preparation status or newer local timestamp, retain it and push to cloud
+                const isLocalProgressed = (localOrder.status !== 'new' && cloudOrder.status === 'new') || localTime > cloudTime;
+                if (isLocalProgressed) {
+                  const mergedOrder: Order = { ...cloudOrder, ...localOrder };
+                  orderMap.set(localOrder.id, mergedOrder);
+                  saveOrderToFirestore(mergedOrder).catch(() => {});
+                }
+              }
+            }
+          });
+
+          const merged = Array.from(orderMap.values()).sort(
+            (a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+          );
+          storage.saveOrders(merged);
+          return merged;
+        });
+      },
+      (error) => {
+        console.info('Firestore orders subscription notice:', error?.message);
+      }
+    );
+
+    // Subscribe to warehouse operations stream for real-time employee preparation visibility
+    const unsubOps = subscribeToWarehouseOperations(
+      (ops) => {
+        if (Array.isArray(ops)) {
+          setOperations(ops);
+        }
+      },
+      (err) => {
+        console.info('Firestore operations subscription notice:', err?.message);
+      }
+    );
+
+    return () => {
+      unsubOrders();
+      unsubOps();
+    };
+  }, []);
 
   // Sync state to local storage whenever they change
   useEffect(() => {
@@ -236,7 +715,7 @@ export default function App() {
     }
   }, []);
 
-  // Validate on mount, currentUser change, tab focus, and storage changes
+  // Validate on mount, tab focus, and storage changes
   useEffect(() => {
     verifyCurrentSession();
     const handleFocus = () => verifyCurrentSession();
@@ -256,89 +735,82 @@ export default function App() {
       window.removeEventListener('storage', handleStorage);
       document.removeEventListener('visibilitychange', handleVisibility);
     };
-  }, [verifyCurrentSession, currentUser]);
+  }, [verifyCurrentSession]);
 
-  // Initial seed and server sync (deferred non-blocking so initial open is blazing fast)
+  // Seamless direct entry check: Verify if pending or link-opening user was approved on server so they enter directly
   useEffect(() => {
-    if (!isOnline) return;
+    const checkLiveApproval = async () => {
+      const user = storage.getCurrentUser();
+      if (!user || user.founder || user.id === 'user-super-admin-master') return;
 
-    // Seed server store after initial render has completed
-    const seedTimer = setTimeout(() => {
-      fetch('/api/seed', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ products, orders, users: registeredUsers }),
-      }).catch(() => {
-        // Server might be starting up, safe to ignore
-      });
-    }, 1200);
+      try {
+        const queryParams = new URLSearchParams();
+        if (user.id) queryParams.set('id', user.id);
+        if (user.identifier) queryParams.set('identifier', user.identifier);
+        if (user.email) queryParams.set('email', user.email);
 
-    return () => clearTimeout(seedTimer);
-  }, [isOnline]);
-
-  // Live synchronization of registered users and approval status from backend server
-  const syncServerUsers = useCallback(async (isInitial = false) => {
-    try {
-      const res = await fetch('/api/auth/users', {
-        headers: { 'Cache-Control': 'no-cache' }
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (Array.isArray(data.users)) {
-          setRegisteredUsers((prev) => {
-            const userMap = new Map<string, AppUser>();
-            // Add server users first (server is the single source of truth)
-            data.users.forEach((u: AppUser) => {
-              const key = u.id || (u.identifier ? u.identifier.toLowerCase() : '');
-              if (key) userMap.set(key, u);
-            });
-            // Keep any local pending user that might not have synced yet
-            prev.forEach((u) => {
-              const key = u.id || (u.identifier ? u.identifier.toLowerCase() : '');
-              if (key && !userMap.has(key)) {
-                userMap.set(key, u);
+        const res = await fetch(`/api/auth/status?${queryParams.toString()}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.found && data.user) {
+            const serverUser: AppUser = data.user;
+            if (serverUser.status === 'approved' && user.status !== 'approved') {
+              const updated: AppUser = {
+                ...user,
+                ...serverUser,
+                status: 'approved',
+                role: serverUser.role && serverUser.role !== 'pending' ? serverUser.role : (user.role && user.role !== 'pending' ? user.role : 'pharmacy'),
+              };
+              storage.setCurrentUser(updated);
+              setCurrentUser(updated);
+              if (updated.role === 'pharmacy') {
+                setCurrentView('pharmacy');
               }
-            });
-            const merged = Array.from(userMap.values());
-
-            // Check if there is a newly arrived pending user for notification
-            if (!isInitial) {
-              const prevPendingIds = new Set(prev.filter((u) => u.status === 'pending').map((u) => u.id));
-              const newlyPending = merged.find((u) => u.status === 'pending' && !prevPendingIds.has(u.id));
-              if (newlyPending) {
-                setNewRegistrationAlert(newlyPending);
-                if (soundEnabled) {
-                  playWarningAlertChime();
-                }
+              if (soundEnabled) {
+                playSuccessChime();
+              }
+            } else if (serverUser.status === 'approved' && user.status === 'approved') {
+              if (serverUser.role && serverUser.role !== user.role && serverUser.role !== 'pending') {
+                const updated: AppUser = { ...user, role: serverUser.role };
+                storage.setCurrentUser(updated);
+                setCurrentUser(updated);
               }
             }
-
-            storage.saveRegisteredUsers(merged);
-            return merged;
-          });
+          }
         }
+      } catch (e) {
+        console.warn('Live approval verification error:', e);
       }
-    } catch (err) {
-      console.warn('Failed to sync users from server:', err);
-    }
-  }, [soundEnabled]);
+    };
 
-  // Initial user sync and continuous background polling interval across all devices
+    checkLiveApproval();
+  }, [soundEnabled, playSuccessChime]);
+
+  // Stable refs for sync functions to prevent background polling restart loops
+  const syncServerUsersRef = useRef(syncServerUsers);
+  syncServerUsersRef.current = syncServerUsers;
+  const syncServerOrdersRef = useRef(syncServerOrders);
+  syncServerOrdersRef.current = syncServerOrders;
+
+  // Initial user and orders sync and background polling interval across all devices
   useEffect(() => {
     if (!isOnline) return;
 
     // Run immediately on load
-    syncServerUsers(true);
+    syncServerUsersRef.current(true);
+    syncServerOrdersRef.current(true);
 
-    // Continuous polling interval every 6 seconds to ensure requests are never missed across mobile devices
+    // Efficient background polling interval to keep all warehouse accounts completely synchronized
     const pollInterval = setInterval(() => {
-      syncServerUsers(false);
-    }, 6000);
+      syncServerUsersRef.current(false);
+      syncServerOrdersRef.current(false);
+    }, 8000);
 
     // Also trigger on window focus and screen wake
     const handleFocusSync = () => {
       if (document.visibilityState === 'visible') {
-        syncServerUsers(false);
+        syncServerUsersRef.current(false);
+        syncServerOrdersRef.current(false);
       }
     };
     window.addEventListener('focus', handleFocusSync);
@@ -349,7 +821,14 @@ export default function App() {
       window.removeEventListener('focus', handleFocusSync);
       document.removeEventListener('visibilitychange', handleFocusSync);
     };
-  }, [isOnline, syncServerUsers]);
+  }, [isOnline]);
+
+  // Sync orders whenever logged-in user changes
+  useEffect(() => {
+    if (currentUser) {
+      syncServerOrdersRef.current(false);
+    }
+  }, [currentUser?.id]);
 
   // Setup Server-Sent Events (SSE) for live order notifications across tabs & devices
   useEffect(() => {
@@ -387,9 +866,14 @@ export default function App() {
             storage.saveRegisteredUsers(updated);
             return updated;
           });
-          setNewRegistrationAlert(incomingUser);
-          if (soundEnabled) {
-            playWarningAlertChime();
+          if (
+            incomingUser.status === 'pending' &&
+            !storage.isAlertHandled(incomingUser.id, incomingUser.identifier, incomingUser.phone, incomingUser.email)
+          ) {
+            setNewRegistrationAlert(incomingUser);
+            if (soundEnabled) {
+              playWarningAlertChime();
+            }
           }
         } catch {}
       });
@@ -403,11 +887,50 @@ export default function App() {
             storage.saveRegisteredUsers(updated);
             return updated;
           });
-          if (updatedUser.status === 'pending') {
+          if (
+            updatedUser.status === 'pending' &&
+            !storage.isAlertHandled(updatedUser.id, updatedUser.identifier, updatedUser.phone, updatedUser.email)
+          ) {
             setNewRegistrationAlert(updatedUser);
             if (soundEnabled) {
               playWarningAlertChime();
             }
+          } else {
+            // Dismiss alert if this updated user is no longer pending
+            storage.markAlertHandled(updatedUser.id, updatedUser.identifier, updatedUser.phone, updatedUser.email);
+            setNewRegistrationAlert((curr) => {
+              if (!curr) return null;
+              if (
+                curr.id === updatedUser.id ||
+                (curr.identifier && updatedUser.identifier && curr.identifier.toLowerCase() === updatedUser.identifier.toLowerCase()) ||
+                (curr.phone && updatedUser.phone && curr.phone === updatedUser.phone) ||
+                (curr.email && updatedUser.email && curr.email.toLowerCase() === updatedUser.email.toLowerCase())
+              ) {
+                return null;
+              }
+              return curr;
+            });
+          }
+
+          if (updatedUser.status === 'approved') {
+            setCurrentUser((curr) => {
+              if (
+                curr &&
+                (curr.id === updatedUser.id ||
+                  (curr.identifier && updatedUser.identifier && curr.identifier.toLowerCase() === updatedUser.identifier.toLowerCase()) ||
+                  (curr.email && updatedUser.email && curr.email.toLowerCase() === updatedUser.email.toLowerCase()))
+              ) {
+                storage.setCurrentUser(updatedUser);
+                if (updatedUser.role === 'pharmacy') {
+                  setCurrentView('pharmacy');
+                }
+                if (soundEnabled) {
+                  playSuccessChime();
+                }
+                return updatedUser;
+              }
+              return curr;
+            });
           }
         } catch {}
       });
@@ -415,6 +938,19 @@ export default function App() {
       eventSource.addEventListener('user_approved', (e) => {
         try {
           const approvedUser: AppUser = JSON.parse(e.data);
+          storage.markAlertHandled(approvedUser.id, approvedUser.identifier, approvedUser.phone, approvedUser.email);
+          setNewRegistrationAlert((curr) => {
+            if (!curr) return null;
+            if (
+              curr.id === approvedUser.id ||
+              (curr.identifier && approvedUser.identifier && curr.identifier.toLowerCase() === approvedUser.identifier.toLowerCase()) ||
+              (curr.phone && approvedUser.phone && curr.phone === approvedUser.phone) ||
+              (curr.email && approvedUser.email && curr.email.toLowerCase() === approvedUser.email.toLowerCase())
+            ) {
+              return null;
+            }
+            return curr;
+          });
           setRegisteredUsers((prev) => {
             const updated = prev.map((u) => (u.id === approvedUser.id ? approvedUser : u));
             storage.saveRegisteredUsers(updated);
@@ -422,10 +958,21 @@ export default function App() {
           });
           // Dispatch window event for modal listeners
           window.dispatchEvent(new MessageEvent('sse_user_approved', { data: e.data }));
-          // If current logged-in user was approved
+          // If current logged-in user was approved, seamlessly transition immediately
           setCurrentUser((curr) => {
-            if (curr && (curr.id === approvedUser.id || curr.identifier === approvedUser.identifier)) {
+            if (
+              curr &&
+              (curr.id === approvedUser.id ||
+                (curr.identifier && approvedUser.identifier && curr.identifier.toLowerCase() === approvedUser.identifier.toLowerCase()) ||
+                (curr.email && approvedUser.email && curr.email.toLowerCase() === approvedUser.email.toLowerCase()))
+            ) {
               storage.setCurrentUser(approvedUser);
+              if (approvedUser.role === 'pharmacy') {
+                setCurrentView('pharmacy');
+              }
+              if (soundEnabled) {
+                playSuccessChime();
+              }
               return approvedUser;
             }
             return curr;
@@ -436,6 +983,19 @@ export default function App() {
       eventSource.addEventListener('user_rejected', (e) => {
         try {
           const rejectedUser: AppUser = JSON.parse(e.data);
+          storage.markAlertHandled(rejectedUser.id, rejectedUser.identifier, rejectedUser.phone, rejectedUser.email);
+          setNewRegistrationAlert((curr) => {
+            if (!curr) return null;
+            if (
+              curr.id === rejectedUser.id ||
+              (curr.identifier && rejectedUser.identifier && rejectedUser.identifier.toLowerCase() === rejectedUser.identifier.toLowerCase()) ||
+              (curr.phone && rejectedUser.phone && curr.phone === rejectedUser.phone) ||
+              (curr.email && rejectedUser.email && curr.email.toLowerCase() === rejectedUser.email.toLowerCase())
+            ) {
+              return null;
+            }
+            return curr;
+          });
           setRegisteredUsers((prev) => {
             const updated = prev.map((u) => (u.id === rejectedUser.id ? rejectedUser : u));
             storage.saveRegisteredUsers(updated);
@@ -496,6 +1056,9 @@ export default function App() {
         try {
           const updated: Order = JSON.parse(e.data);
           setOrders((prev) => prev.map((o) => (o.id === updated.id ? updated : o)));
+          if (updated.status !== 'new') {
+            setNewOrderAlert((curr) => (curr && curr.id === updated.id ? null : curr));
+          }
         } catch {
           // ignore
         }
@@ -514,6 +1077,21 @@ export default function App() {
         try {
           const { id } = JSON.parse(e.data);
           setOrders((prev) => prev.filter((o) => o.id !== id));
+          setNewOrderAlert((curr) => (curr && curr.id === id ? null : curr));
+        } catch {
+          // ignore
+        }
+      });
+
+      eventSource.addEventListener('orders_bulk_deleted', (e) => {
+        try {
+          const { ids } = JSON.parse(e.data);
+          if (Array.isArray(ids) && ids.length > 0) {
+            const idSet = new Set(ids);
+            storage.deleteOrders(ids);
+            setOrders((prev) => prev.filter((o) => !idSet.has(o.id)));
+            setNewOrderAlert((curr) => (curr && idSet.has(curr.id) ? null : curr));
+          }
         } catch {
           // ignore
         }
@@ -780,14 +1358,64 @@ export default function App() {
 
   // Warehouse status update
   const handleUpdateOrderStatus = (orderId: string, status: OrderStatus, rejectionReason?: string) => {
-    setOrders((prev) =>
-      prev.map((o) => (o.id === orderId ? { ...o, status, rejectionReason: rejectionReason || o.rejectionReason } : o))
-    );
+    const nowIso = new Date().toISOString();
+    let updatedOrderObj: Order | null = null;
+
+    setOrders((prev) => {
+      const updated = prev.map((o) => {
+        if (o.id === orderId) {
+          const mod: Order = {
+            ...o,
+            status,
+            rejectionReason: rejectionReason || o.rejectionReason,
+            preparedAt: (status === 'ready' || status === 'preparing') ? nowIso : (o.preparedAt || nowIso),
+            completedAt: status === 'delivered' ? (o.completedAt || nowIso) : o.completedAt,
+            lastUpdatedAt: nowIso,
+          };
+          updatedOrderObj = mod;
+          return mod;
+        }
+        return o;
+      });
+      storage.saveOrders(updated);
+      return updated;
+    });
+
+    if (newOrderAlert && newOrderAlert.id === orderId) {
+      setNewOrderAlert(null);
+    }
+
+    if (updatedOrderObj) {
+      const targetOrder = updatedOrderObj as Order;
+      // Persist directly to Firestore so all devices see the updated preparation state
+      saveOrderToFirestore(targetOrder).catch((err) => console.warn('Firestore order status save error:', err));
+      logWarehouseOperation({
+        type: 'status_changed',
+        actionTitle: status === 'ready' ? 'اكتمال تجهيز الطلبية' : status === 'delivered' ? 'تسليم الطلبية للصيدلية' : 'تحديث مسار الطلب',
+        details: `تم تغيير حالة طلبية ${targetOrder.pharmacyName} (${targetOrder.orderNumber}) إلى "${status === 'ready' ? 'جاهزة للتسليم' : status === 'delivered' ? 'تم التسليم' : status === 'preparing' ? 'قيد التجهيز' : status}"`,
+        orderId: targetOrder.id,
+        orderNumber: targetOrder.orderNumber,
+        pharmacyName: targetOrder.pharmacyName,
+        performedBy: currentUser?.name || currentUser?.role || 'كادر المذخر',
+        targetStatus: status,
+        status: status,
+        itemsCount: targetOrder.items?.length || 0,
+        totalQuantity: targetOrder.totalQuantity || targetOrder.items?.reduce((s, i) => s + (i.quantity || 0) + (i.bonusQuantity || 0), 0) || 0,
+        totalAmount: targetOrder.totalAmount,
+        items: targetOrder.items || [],
+      }).catch(() => {});
+    }
+
     if (isOnline) {
       fetch(`/api/orders/${orderId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status, rejectionReason }),
+        body: JSON.stringify({ 
+          status, 
+          rejectionReason,
+          completedAt: status === 'delivered' ? nowIso : undefined,
+          preparedAt: (status === 'ready' || status === 'preparing') ? nowIso : undefined
+        }),
       }).catch(() => {});
     }
   };
@@ -799,22 +1427,56 @@ export default function App() {
     status?: OrderStatus,
     preparedBy?: string
   ) => {
-    setOrders((prev) =>
-      prev.map((o) => {
+    const nowIso = new Date().toISOString();
+    let updatedOrderObj: Order | null = null;
+
+    setOrders((prev) => {
+      const updated = prev.map((o) => {
         if (o.id === orderId) {
-          return {
+          const mod: Order = {
             ...o,
             items: updatedItems,
             status: status || o.status,
-            preparedBy: preparedBy || o.preparedBy,
-            preparedAt: status === 'ready' ? new Date().toISOString() : o.preparedAt,
+            preparedBy: preparedBy || o.preparedBy || currentUser?.name || 'كادر التجهيز',
+            preparedAt: nowIso,
+            completedAt: status === 'delivered' ? (o.completedAt || nowIso) : o.completedAt,
+            lastUpdatedAt: nowIso,
           };
+          updatedOrderObj = mod;
+          return mod;
         }
         return o;
-      })
-    );
+      });
+      storage.saveOrders(updated);
+      return updated;
+    });
+
+    if (newOrderAlert && newOrderAlert.id === orderId) {
+      setNewOrderAlert(null);
+    }
 
     playSuccessChime();
+
+    if (updatedOrderObj) {
+      const targetOrder = updatedOrderObj as Order;
+      // Persist directly to Firestore for immediate sync to founder and all colleagues
+      saveOrderToFirestore(targetOrder).catch((err) => console.warn('Firestore preparation save error:', err));
+      logWarehouseOperation({
+        type: 'order_prepared',
+        actionTitle: 'تجهيز وفحص صلاحيات الطلبية',
+        details: `قام ${targetOrder.preparedBy} بتجهيز ومطابقة وجبات طلبية ${targetOrder.pharmacyName} (${targetOrder.orderNumber})`,
+        orderId: targetOrder.id,
+        orderNumber: targetOrder.orderNumber,
+        pharmacyName: targetOrder.pharmacyName,
+        performedBy: targetOrder.preparedBy || currentUser?.name || 'كادر التجهيز',
+        targetStatus: targetOrder.status,
+        status: targetOrder.status,
+        itemsCount: targetOrder.items?.length || 0,
+        totalQuantity: targetOrder.totalQuantity || targetOrder.items?.reduce((s, i) => s + (i.quantity || 0) + (i.bonusQuantity || 0), 0) || 0,
+        totalAmount: targetOrder.totalAmount,
+        items: targetOrder.items || [],
+      }).catch(() => {});
+    }
 
     if (isOnline) {
       fetch(`/api/orders/${orderId}`, {
@@ -823,15 +1485,115 @@ export default function App() {
         body: JSON.stringify({
           items: updatedItems,
           status: status,
-          preparedBy: preparedBy,
+          preparedBy: preparedBy || currentUser?.name,
+          preparedAt: (status === 'ready' || status === 'preparing') ? nowIso : undefined,
+          completedAt: status === 'delivered' ? nowIso : undefined,
         }),
+      }).catch(() => {});
+    }
+  };
+
+  // Warehouse direct order edit (quantities, bonus, items, totals)
+  const handleUpdateOrder = (updatedOrder: Order) => {
+    setOrders((prev) => {
+      const updated = prev.map((o) => (o.id === updatedOrder.id ? updatedOrder : o));
+      storage.saveOrders(updated);
+      return updated;
+    });
+
+    if (newOrderAlert && newOrderAlert.id === updatedOrder.id) {
+      setNewOrderAlert(null);
+    }
+
+    playSuccessChime();
+
+    // Persist to Firestore and log operation
+    saveOrderToFirestore(updatedOrder).catch((err) => console.warn('Firestore update order error:', err));
+    logWarehouseOperation({
+      type: 'order_edited',
+      actionTitle: 'تعديل كميات وبونص الطلبية',
+      details: `تم تعديل أصناف أو كميات طلبية ${updatedOrder.pharmacyName} (${updatedOrder.orderNumber}) بواسطة ${currentUser?.name || 'كادر المذخر'}`,
+      orderId: updatedOrder.id,
+      orderNumber: updatedOrder.orderNumber,
+      pharmacyName: updatedOrder.pharmacyName,
+      performedBy: currentUser?.name || 'كادر المذخر',
+      status: updatedOrder.status,
+      itemsCount: updatedOrder.items?.length || 0,
+      totalQuantity: updatedOrder.totalQuantity || updatedOrder.items?.reduce((s, i) => s + (i.quantity || 0) + (i.bonusQuantity || 0), 0) || 0,
+      totalAmount: updatedOrder.totalAmount,
+      items: updatedOrder.items || [],
+    }).catch(() => {});
+
+    if (isOnline) {
+      fetch(`/api/orders/${updatedOrder.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatedOrder),
+      }).catch(() => {});
+    }
+  };
+
+  // Warehouse direct dispatch order (created directly by warehouse employee for pharmacy)
+  const handleAddDirectOrder = (newOrder: Order) => {
+    const nowIso = new Date().toISOString();
+    const stampedOrder: Order = {
+      ...newOrder,
+      preparedAt: newOrder.preparedAt || nowIso,
+      preparedBy: newOrder.preparedBy || currentUser?.name || 'كادر المذخر',
+      completedAt: newOrder.status === 'delivered' ? (newOrder.completedAt || nowIso) : newOrder.completedAt,
+    };
+    setOrders((prev) => [stampedOrder, ...prev.filter((o) => o.id !== stampedOrder.id)]);
+    storage.addOrder(stampedOrder);
+    playSuccessChime();
+
+    // Persist to Firestore immediately so all accounts see this direct dispatch instantly
+    saveOrderToFirestore(stampedOrder).catch((err) => console.warn('Firestore add direct order error:', err));
+    logWarehouseOperation({
+      type: 'order_created',
+      actionTitle: 'إنشاء وتجهيز طلبية مباشرة',
+      details: `تم إنشاء وتجهيز طلبية مباشرة لـ "${stampedOrder.pharmacyName}" (${stampedOrder.orderNumber}) بمبلغ ${(stampedOrder.totalAmount ?? 0).toLocaleString()} د.ع بواسطة ${currentUser?.name || 'كادر المذخر'}`,
+      orderId: stampedOrder.id,
+      orderNumber: stampedOrder.orderNumber,
+      pharmacyName: stampedOrder.pharmacyName,
+      performedBy: currentUser?.name || 'كادر المذخر',
+      targetStatus: stampedOrder.status,
+      status: stampedOrder.status,
+      itemsCount: stampedOrder.items?.length || 0,
+      totalQuantity: stampedOrder.totalQuantity || stampedOrder.items?.reduce((s, i) => s + (i.quantity || 0) + (i.bonusQuantity || 0), 0) || 0,
+      totalAmount: stampedOrder.totalAmount,
+      items: stampedOrder.items || [],
+    }).catch(() => {});
+
+    if (isOnline) {
+      fetch('/api/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...stampedOrder, mergePending: false }),
       }).catch(() => {});
     }
   };
 
   // Delete Order with persistence and real-time backend sync
   const handleDeleteOrder = async (orderId: string) => {
+    const target = orders.find((o) => o.id === orderId);
     storage.deleteOrder(orderId);
+    if (newOrderAlert && newOrderAlert.id === orderId) {
+      setNewOrderAlert(null);
+    }
+    // Delete from Firestore
+    deleteOrderFromFirestore(orderId).catch(() => {});
+    if (target) {
+      logWarehouseOperation({
+        type: 'order_deleted',
+        actionTitle: 'حذف طلبية',
+        details: `تم حذف طلبية ${target.pharmacyName} (${target.orderNumber}) بواسطة ${currentUser?.name || 'كادر المذخر'}`,
+        orderId: target.id,
+        orderNumber: target.orderNumber,
+        pharmacyName: target.pharmacyName,
+        performedBy: currentUser?.name || 'كادر المذخر',
+      }).catch(() => {});
+    }
+
     if (isOnline) {
       try {
         await fetch(`/api/orders/${orderId}`, { method: 'DELETE' });
@@ -840,6 +1602,29 @@ export default function App() {
       }
     }
     setOrders((prev) => prev.filter((o) => o.id !== orderId));
+  };
+
+  // Delete Orders in bulk (e.g. all pending orders)
+  const handleDeleteOrdersBulk = async (orderIds: string[]) => {
+    if (!orderIds || orderIds.length === 0) return;
+    const idSet = new Set(orderIds);
+    storage.deleteOrders(orderIds);
+    if (newOrderAlert && idSet.has(newOrderAlert.id)) {
+      setNewOrderAlert(null);
+    }
+    deleteOrdersFromFirestore(orderIds).catch(() => {});
+    if (isOnline) {
+      try {
+        await fetch('/api/orders/bulk-delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids: orderIds }),
+        });
+      } catch (err) {
+        console.warn('Backend bulk delete orders failed:', err);
+      }
+    }
+    setOrders((prev) => prev.filter((o) => !idSet.has(o.id)));
   };
 
   // Delete Pharmacy with optional orders cleanup
@@ -958,31 +1743,49 @@ export default function App() {
   // "من يملك الرابط يسجل دخول أما صيدلية بمعلوماتها أو موظف مذخر وانا اوافق"
   // =========================================================================
 
-  // 1. Permanently deleted / banned account check
-  const isUserPermanentlyDeleted = Boolean(
+  // 1. Permanently deleted / blocked account check
+  const isProtectedUser = Boolean(
     currentUser && (
+      currentUser.founder ||
+      currentUser.role === 'founder' ||
+      currentUser.role === 'owner' ||
+      currentUser.role === 'super_admin' ||
+      currentUser.role === 'warehouse_manager' ||
+      currentUser.role === 'pharmacist_staff' ||
+      currentUser.role === 'staff' ||
+      currentUser.identifier === 'mohammedjafaralkabi@gmail.com' ||
+      (currentUser.email && currentUser.email.toLowerCase() === 'mohammedjafaralkabi@gmail.com') ||
+      currentUser.status === 'approved'
+    )
+  );
+
+  const isUserPermanentlyDeleted = Boolean(
+    !isProtectedUser &&
+    currentUser && (
+      currentUser.status === 'blocked' ||
+      currentUser.status === 'deleted' ||
       storage.isUserDeleted(currentUser.id, currentUser.identifier, currentUser.pharmacyName) ||
-      (currentUser.pharmacyName && storage.isPharmacyDeleted(currentUser.pharmacyName)) ||
-      (prefilledPharmacyName && (storage.isPharmacyDeleted(prefilledPharmacyName) || storage.isUserDeleted(undefined, undefined, prefilledPharmacyName)))
+      (currentUser.pharmacyName && storage.isPharmacyDeleted(currentUser.pharmacyName))
     )
   );
 
   if (isUserPermanentlyDeleted) {
     return (
-      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-4">
-        <div className="max-w-md w-full bg-white rounded-3xl p-6 text-center space-y-4 shadow-2xl border border-rose-200">
+      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4">
+        <div className="max-w-md w-full bg-white rounded-3xl p-6 text-center space-y-4 shadow-xl border border-rose-200">
           <div className="w-14 h-14 bg-rose-50 text-rose-600 rounded-2xl mx-auto flex items-center justify-center">
             <AlertCircle className="w-7 h-7" />
           </div>
-          <h3 className="text-lg font-black text-slate-900">تم حظر الوصول</h3>
+          <h3 className="text-lg font-black text-slate-900">تم إلغاء صلاحية الوصول إلى النظام</h3>
           <p className="text-xs text-slate-600 leading-relaxed">
-            تم حذف تصريح هذا الحساب أو الصيدلية نهائياً من قبل إدارة المذخر • تم منع الدخول للنظام.
+            تم إلغاء صلاحية الوصول إلى النظام من قبل إدارة المذخر • يرجى التواصل مع إدارة مذخر سامو للأدوية.
           </p>
           <button
             type="button"
             onClick={() => {
-              setCurrentUser(null);
+              localStorage.removeItem('samo_user_session');
               storage.setCurrentUser(null);
+              setCurrentUser(null);
             }}
             className="px-5 py-2.5 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-black transition cursor-pointer"
           >
@@ -993,38 +1796,8 @@ export default function App() {
     );
   }
 
-  // 2. Unauthenticated User Gate: Anyone opening the link MUST register or log in!
-  if (!currentUser) {
-    return (
-      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-3 sm:p-4">
-        <AuthModal
-          isOpen={true}
-          currentUser={null}
-          settings={settings}
-          canDismiss={false}
-          customMessage="مرحباً بك في مذخر سامو للأدوية • يرجى تسجيل الدخول أو تسجيل حساب جديد (صيدلية أو موظف مذخر)"
-          onLoginSuccess={(user) => {
-            setCurrentUser(user);
-            storage.setCurrentUser(user);
-            if (user.status === 'approved') {
-              if (user.role === 'pharmacy') {
-                setCurrentView('pharmacy');
-              } else {
-                setCurrentView('warehouse');
-              }
-            }
-          }}
-          onLogout={() => {
-            setCurrentUser(null);
-            storage.setCurrentUser(null);
-          }}
-        />
-      </div>
-    );
-  }
-
-  // 3. Pending Approval Screen: If account is pending review from Mohammed Jafar Alkabi
-  if (currentUser.status === 'pending') {
+  // 2. Pending Approval Screen: For any pharmacy awaiting Founder approval
+  if (currentUser && (currentUser.status === 'pending' || currentUser.role === 'pending')) {
     return (
       <PendingApprovalScreen
         user={currentUser}
@@ -1039,7 +1812,9 @@ export default function App() {
             setCurrentView('warehouse');
           }
         }}
-        onLogout={() => {
+        onLogout={async () => {
+          await signOutFirebase();
+          localStorage.removeItem('samo_user_session');
           setCurrentUser(null);
           storage.setCurrentUser(null);
         }}
@@ -1047,21 +1822,23 @@ export default function App() {
     );
   }
 
-  // 4. Rejected or Deactivated User Screen
-  if (currentUser.status === 'rejected' || currentUser.status === 'deactivated') {
+  // 3. Rejected or Deactivated User Screen
+  if (currentUser && (currentUser.status === 'rejected' || currentUser.status === 'deactivated')) {
     return (
-      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-4">
-        <div className="max-w-md w-full bg-white rounded-3xl p-6 text-center space-y-4 shadow-2xl border border-rose-200">
+      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4">
+        <div className="max-w-md w-full bg-white rounded-3xl p-6 text-center space-y-4 shadow-xl border border-rose-200">
           <div className="w-14 h-14 bg-rose-50 text-rose-600 rounded-2xl mx-auto flex items-center justify-center">
             <AlertCircle className="w-7 h-7" />
           </div>
-          <h3 className="text-lg font-black text-slate-900">طلب الحساب غير مفعل</h3>
+          <h3 className="text-lg font-black text-slate-900">تم رفض هذا الحساب</h3>
           <p className="text-xs text-slate-600 leading-relaxed">
-            تم رفض أو إلغاء تنشيط هذا الحساب من قبل إدارة مذخر سامو. يرجى التواصل مع المشرف العام.
+            تم رفض طلب تسجيل هذا الحساب من قبل إدارة مذخر سامو. يرجى التواصل هاتفياً مع إدارة المذخر في حال وجود أي استفسار.
           </p>
           <button
             type="button"
-            onClick={() => {
+            onClick={async () => {
+              await signOutFirebase();
+              localStorage.removeItem('samo_user_session');
               setCurrentUser(null);
               storage.setCurrentUser(null);
             }}
@@ -1074,10 +1851,136 @@ export default function App() {
     );
   }
 
-  // 5. Approved Pharmacy Portal View
-  if (currentUser.role === 'pharmacy') {
+  // 4. Unauthenticated Visitor Catalog (Browsing allowed, cart locked)
+  if (!currentUser && currentView === 'pharmacy') {
     return (
-      <>
+      <React.Suspense fallback={<ViewLoader />}>
+        <PharmacyPortal
+          products={products}
+          cart={cart}
+          orders={orders}
+          onAddToCart={handleAddToCart}
+          onUpdateCartQuantity={handleUpdateCartQuantity}
+          onRemoveFromCart={handleRemoveFromCart}
+          onClearCart={handleClearCart}
+          onSubmitOrder={handleSubmitOrder}
+          settings={settings}
+          prefilledPharmacyName=""
+          currentUser={null}
+          onOpenAuth={() => setIsAuthModalOpen(true)}
+          onDeleteOrder={handleDeleteOrder}
+          onDeleteOrdersBulk={handleDeleteOrdersBulk}
+          onLogout={async () => {
+            await signOutFirebase();
+            localStorage.removeItem('samo_user_session');
+            setCurrentUser(null);
+            storage.setCurrentUser(null);
+          }}
+          onSwitchToWarehouse={() => {
+            setCurrentView('warehouse');
+          }}
+          onUpdateSettings={(newSettings) => setSettings(newSettings)}
+        />
+        <OfflineIndicator />
+        {isAuthModalOpen && (
+          <AuthModal
+            isOpen={true}
+            currentUser={null}
+            settings={settings}
+            canDismiss={true}
+            customMessage={authModalCustomMessage || "مرحباً بك في مذخر سامو للأدوية • يرجى تسجيل الدخول أو إرسال طلب تسجيل صيدلية"}
+            onClose={() => setIsAuthModalOpen(false)}
+            onLoginSuccess={(user) => {
+              setCurrentUser(user);
+              storage.setCurrentUser(user);
+              setIsAuthModalOpen(false);
+              if (user.status === 'approved') {
+                if (user.role === 'pharmacy') {
+                  setCurrentView('pharmacy');
+                } else {
+                  setCurrentView('warehouse');
+                }
+              }
+            }}
+            onLogout={async () => {
+              await signOutFirebase();
+              localStorage.removeItem('samo_user_session');
+              setCurrentUser(null);
+              storage.setCurrentUser(null);
+            }}
+          />
+        )}
+      </React.Suspense>
+    );
+  }
+
+  // 5. Unauthenticated User Gate for other views (Warehouse, Inventory, etc.)
+  if (!currentUser) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-3 sm:p-4">
+        <AuthModal
+          isOpen={true}
+          currentUser={null}
+          settings={settings}
+          canDismiss={true}
+          onClose={() => setCurrentView('pharmacy')}
+          customMessage="مرحباً بك في مذخر سامو للأدوية • يرجى تسجيل الدخول أو استعراض بوابة الصيدليات"
+          onLoginSuccess={(user) => {
+            setCurrentUser(user);
+            storage.setCurrentUser(user);
+            if (user.status === 'approved') {
+              if (user.role === 'pharmacy') {
+                setCurrentView('pharmacy');
+              } else {
+                setCurrentView('warehouse');
+              }
+            }
+          }}
+          onLogout={async () => {
+            await signOutFirebase();
+            localStorage.removeItem('samo_user_session');
+            setCurrentUser(null);
+            storage.setCurrentUser(null);
+          }}
+        />
+      </div>
+    );
+  }
+
+  // 6. Approved Pharmacy Portal View
+  if (currentUser.role === 'pharmacy') {
+    // Check if pharmacy needs initial one-time onboarding
+    const needsOnboarding = !currentUser.profileCompleted && (
+      !currentUser.pharmacyName ||
+      currentUser.pharmacyName === 'مستخدم جديد' ||
+      !currentUser.syndicateNumber ||
+      !currentUser.phone ||
+      !currentUser.address
+    );
+
+    if (needsOnboarding) {
+      return (
+        <React.Suspense fallback={<ViewLoader />}>
+          <PharmacyOnboardingModal
+            user={currentUser}
+            onCompleted={(updatedUser) => {
+              setCurrentUser(updatedUser);
+              storage.setCurrentUser(updatedUser);
+              setCurrentView('pharmacy');
+            }}
+            onLogout={async () => {
+              await signOutFirebase();
+              localStorage.removeItem('samo_user_session');
+              setCurrentUser(null);
+              storage.setCurrentUser(null);
+            }}
+          />
+        </React.Suspense>
+      );
+    }
+
+    return (
+      <React.Suspense fallback={<ViewLoader />}>
         <PharmacyPortal
           products={products}
           cart={cart}
@@ -1090,7 +1993,12 @@ export default function App() {
           settings={settings}
           prefilledPharmacyName={currentUser.pharmacyName || prefilledPharmacyName}
           currentUser={currentUser}
-          onLogout={() => {
+          onOpenAuth={() => setIsAuthModalOpen(true)}
+          onDeleteOrder={handleDeleteOrder}
+          onDeleteOrdersBulk={handleDeleteOrdersBulk}
+          onLogout={async () => {
+            await signOutFirebase();
+            localStorage.removeItem('samo_user_session');
             setCurrentUser(null);
             storage.setCurrentUser(null);
           }}
@@ -1098,62 +2006,56 @@ export default function App() {
           onUpdateSettings={(newSettings) => setSettings(newSettings)}
         />
         <OfflineIndicator />
-      </>
+      </React.Suspense>
     );
   }
 
-  // 6. Approved Warehouse Staff / Manager / Owner / Super Admin Gate
-  const currentPinVersion = storage.getOwnerPasscodeVersion();
+  // 7. Approved Warehouse / Founder Gate
   const isFounderUser = Boolean(
     currentUser &&
-    (currentUser.founder ||
-      currentUser.identifier.toLowerCase() === 'mohammedjafaralkabi@gmail.com' ||
+    (currentUser.id === 'founder_admin' ||
+      currentUser.founder ||
+      currentUser.role === 'founder' ||
+      currentUser.identifier?.toLowerCase() === 'mohammedjafaralkabi@gmail.com' ||
       (currentUser.email && currentUser.email.toLowerCase() === 'mohammedjafaralkabi@gmail.com'))
   );
-  const isOwnerAuthorized = Boolean(
+
+  const isWarehouseAuthorized = Boolean(
     isFounderUser ||
     (currentUser &&
-      (currentUser.role === 'owner' ||
+      (currentUser.role === 'staff' ||
+        currentUser.role === 'warehouse' ||
+        currentUser.role === 'owner' ||
         currentUser.role === 'super_admin' ||
         currentUser.role === 'warehouse_manager' ||
-        currentUser.role === 'pharmacist_staff') &&
-      currentUser.status === 'approved' &&
-      !storage.isUserDeleted(currentUser.id, currentUser.identifier, currentUser.pharmacyName) &&
-      (currentPinVersion === 0 || (currentUser.passcodeVersion && currentUser.passcodeVersion >= currentPinVersion)))
+        currentUser.role === 'pharmacist_staff' ||
+        currentUser.role === 'auditor_readonly' ||
+        currentUser.registrationAccountType === 'warehouse_staff' ||
+        currentUser.status === 'approved') &&
+      currentUser.status === 'approved')
   );
 
-  if (!isOwnerAuthorized) {
-    const isPinOutdated = Boolean(
-      !isFounderUser &&
-      currentUser &&
-      (currentUser.role === 'owner' || currentUser.role === 'super_admin') &&
-      currentPinVersion > 0 &&
-      (!currentUser.passcodeVersion || currentUser.passcodeVersion < currentPinVersion)
-    );
-
+  if (!isWarehouseAuthorized) {
     return (
-      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-4">
+      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4">
         <AuthModal
           isOpen={true}
           currentUser={currentUser}
           settings={settings}
           canDismiss={false}
-          customMessage={
-            isPinOutdated
-              ? "تم تغيير رمز المرور السري للمذخر • تم إبطال الجلسة ويجب إدخال الرمز الجديد للمتابعة كصاحب متجر"
-              : (authModalCustomMessage || "لوحة تحكم المذخر والمخزون محمية • يتطلب تصريح معتمد بالرمز السري")
-          }
+          customMessage="لوحة تحكم المذخر والمخزون مخصصة للإدارة المصرح لها فقط • يرجى تسجيل الدخول بحساب المؤسس أو موظف المذخر"
           onLoginSuccess={(user) => {
             setCurrentUser(user);
             storage.setCurrentUser(user);
-            setAuthModalCustomMessage('');
             if (user.role === 'pharmacy') {
               setCurrentView('pharmacy');
             } else {
               setCurrentView('warehouse');
             }
           }}
-          onLogout={() => {
+          onLogout={async () => {
+            await signOutFirebase();
+            localStorage.removeItem('samo_user_session');
             setCurrentUser(null);
             storage.setCurrentUser(null);
           }}
@@ -1233,16 +2135,63 @@ export default function App() {
           </button>
 
           <button
-            onClick={() => navigateToView('warehouse')}
-            className="w-full text-slate-400 hover:text-white hover:bg-slate-800 px-4 py-2.5 rounded-lg flex items-center gap-3 cursor-pointer text-sm font-semibold transition"
+            onClick={() => {
+              setWarehouseInitialTab('new');
+              navigateToView('warehouse');
+            }}
+            className={`w-full px-4 py-2.5 rounded-lg flex items-center gap-3 cursor-pointer text-sm font-semibold transition ${
+              currentView === 'warehouse' && warehouseInitialTab === 'new'
+                ? 'bg-blue-600 text-white shadow-xs'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800'
+            }`}
           >
-            <Receipt className="w-5 h-5" />
+            <Receipt className="w-5 h-5 text-red-400" />
             <span>الطلبات الواردة</span>
             {newOrdersCount > 0 && (
               <span className="mr-auto bg-red-500 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">
                 {newOrdersCount}
               </span>
             )}
+          </button>
+
+          <button
+            onClick={() => {
+              setWarehouseInitialTab('ready');
+              navigateToView('warehouse');
+            }}
+            className={`w-full px-4 py-2.5 rounded-lg flex items-center gap-3 cursor-pointer text-sm font-semibold transition ${
+              currentView === 'warehouse' && warehouseInitialTab === 'ready'
+                ? 'bg-blue-600 text-white shadow-xs'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800'
+            }`}
+          >
+            <PackageCheck className="w-5 h-5 text-blue-400" />
+            <span>الطلبات المجهزة</span>
+            {orders.filter(o => o.status === 'ready').length > 0 && (
+              <span className="mr-auto bg-blue-500 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">
+                {orders.filter(o => o.status === 'ready').length}
+              </span>
+            )}
+          </button>
+
+          <button
+            id="nav-approved-dispatched-registry"
+            onClick={() => {
+              setWarehouseInitialTab('approved_dispatched');
+              navigateToView('warehouse');
+            }}
+            className={`w-full px-4 py-2.5 rounded-lg flex items-center gap-3 cursor-pointer text-sm font-semibold transition ${
+              currentView === 'warehouse' && warehouseInitialTab === 'approved_dispatched'
+                ? 'bg-indigo-600 text-white shadow-xs font-bold'
+                : 'text-indigo-300 hover:text-white hover:bg-slate-800'
+            }`}
+            title="سجل وتوثيق كافة الطلبيات الموافق عليها والصادرة مع التواريخ"
+          >
+            <FileText className="w-5 h-5 text-indigo-400" />
+            <span>سجل الصادر والمعتمد</span>
+            <span className="mr-auto bg-indigo-500/20 text-indigo-200 text-[10px] font-bold px-2 py-0.5 rounded-full border border-indigo-500/30">
+              مع التاريخ
+            </span>
           </button>
 
           <button
@@ -1266,16 +2215,16 @@ export default function App() {
             <span>روابط السلات</span>
           </button>
 
-          {(currentUser?.role === 'owner' || currentUser?.role === 'super_admin' || currentUser?.founder) && (
+          {(currentUser?.role === 'owner' || currentUser?.role === 'super_admin' || currentUser?.role === 'founder' || currentUser?.role === 'warehouse' || currentUser?.founder || currentUser?.role === 'warehouse_manager' || currentUser?.role === 'staff' || currentUser?.role === 'pharmacist_staff') && (
             <button
               onClick={() => setIsApprovalsModalOpen(true)}
               className="w-full text-amber-300 hover:text-white hover:bg-slate-800 px-4 py-2.5 rounded-lg flex items-center gap-3 cursor-pointer text-sm font-semibold transition"
             >
               <ShieldCheck className="w-5 h-5 text-amber-400" />
               <span>تصاريح وموافقات الدخول</span>
-              {registeredUsers.filter((u) => u.status === 'pending').length > 0 && (
-                <span className="mr-auto bg-amber-500 text-slate-950 text-[10px] font-black px-2 py-0.5 rounded-full shadow-xs">
-                  {registeredUsers.filter((u) => u.status === 'pending').length}
+              {pendingUsers.length > 0 && (
+                <span className="mr-auto bg-amber-500 text-slate-950 text-[10px] font-black px-2 py-0.5 rounded-full shadow-xs animate-pulse">
+                  {pendingUsers.length}
                 </span>
               )}
             </button>
@@ -1328,9 +2277,10 @@ export default function App() {
           settings={settings}
           cartItemCount={cart.length}
           currentUser={currentUser}
-          pendingApprovalsCount={registeredUsers.filter((u) => u.status === 'pending').length}
+          pendingApprovalsCount={pendingUsers.length}
           onOpenApprovals={() => setIsApprovalsModalOpen(true)}
-          onLogout={() => {
+          onLogout={async () => {
+            await signOutFirebase();
             setCurrentUser(null);
             storage.setCurrentUser(null);
             setIsAuthModalOpen(true);
@@ -1341,64 +2291,119 @@ export default function App() {
 
         {/* Main View Display - Contained within mobile screen width with instant zero-lag tab switching */}
         <main className="flex-1 w-full max-w-full pb-24 lg:pb-12 overflow-x-hidden">
-          <div className={currentView === 'warehouse' ? 'block' : 'hidden'} key="view-warehouse">
-            <WarehouseDashboard
-              orders={orders}
-              onUpdateOrderStatus={handleUpdateOrderStatus}
-              onUpdateOrderVerification={handleUpdateOrderVerification}
-              onDeleteOrder={handleDeleteOrder}
-              onDeletePharmacy={handleDeletePharmacy}
-              onOpenShareModalForPharmacy={(pharmacyName) => {
-                setPrefilledPharmacyName(pharmacyName);
-                setIsShareModalOpen(true);
-              }}
-              settings={settings}
-              newOrderAlert={newOrderAlert}
-              onDismissNewOrderAlert={() => setNewOrderAlert(null)}
-              alerts={alerts}
-              onNavigateToInventory={handleNavigateToInventoryWithFilter}
-              onOpenApprovals={() => setIsApprovalsModalOpen(true)}
-              pendingApprovalsCount={registeredUsers.filter((u) => u.status === 'pending').length}
-            />
-          </div>
-
-          {(visitedViews.has('inventory') || currentView === 'inventory') && (
-            <div className={currentView === 'inventory' ? 'block' : 'hidden'} key="view-inventory">
-              <InventoryManager
-                products={products}
-                onAddProduct={handleAddProduct}
-                onBatchAddProducts={handleBatchAddProducts}
-                onUpdateProduct={handleUpdateProduct}
-                onDeleteProduct={handleDeleteProduct}
-                settings={settings}
-                initialFilter={inventoryInitialFilter}
-              />
-            </div>
-          )}
-
-          {(visitedViews.has('add_materials') || currentView === 'add_materials') && (
-            <div className={currentView === 'add_materials' ? 'block' : 'hidden'} key="view-add_materials">
-              <AddMaterialsPage
-                products={products}
-                onAddProduct={handleAddProduct}
-                onBatchAddProducts={handleBatchAddProducts}
-                onNavigateBack={() => navigateToView('inventory')}
-                settings={settings}
-              />
-            </div>
-          )}
-
-          {(visitedViews.has('financial_reports') || currentView === 'financial_reports') && (
-            <div className={currentView === 'financial_reports' ? 'block' : 'hidden'} key="view-financial_reports">
-              <FinancialReportsPage
-                products={products}
+          <React.Suspense fallback={<ViewLoader />}>
+            <div className={currentView === 'warehouse' ? 'block' : 'hidden'} key="view-warehouse">
+              <WarehouseDashboard
                 orders={orders}
+                registeredUsers={registeredUsers}
+                currentUser={currentUser}
+                operations={operations}
+                onUpdateOrderStatus={handleUpdateOrderStatus}
+                onUpdateOrderVerification={handleUpdateOrderVerification}
+                onUpdateOrder={handleUpdateOrder}
+                onAddOrder={handleAddDirectOrder}
+                products={products}
+                onDeleteOrder={handleDeleteOrder}
+                onDeleteOrdersBulk={handleDeleteOrdersBulk}
+                onDeletePharmacy={handleDeletePharmacy}
+                onOpenShareModalForPharmacy={(pharmacyName) => {
+                  setPrefilledPharmacyName(pharmacyName);
+                  setIsShareModalOpen(true);
+                }}
                 settings={settings}
-                onNavigateBack={() => navigateToView('warehouse')}
-                onNavigateToInventoryWithFilter={handleNavigateToInventoryWithFilter}
+                newOrderAlert={newOrderAlert}
+                onDismissNewOrderAlert={() => setNewOrderAlert(null)}
+                alerts={alerts}
+                onNavigateToInventory={handleNavigateToInventoryWithFilter}
+                onOpenApprovals={() => setIsApprovalsModalOpen(true)}
+                pendingApprovalsCount={registeredUsers.filter((u) => u.status === 'pending').length}
+                initialTab={warehouseInitialTab}
               />
             </div>
-          )}
+
+            {(visitedViews.has('pharmacy') || currentView === 'pharmacy') && (
+              <div className={currentView === 'pharmacy' ? 'block' : 'hidden'} key="view-pharmacy">
+                {/* Header preview / return banner when navigated from main navigation */}
+                <div className="bg-gradient-to-r from-blue-900 via-indigo-900 to-slate-900 text-white px-4 py-2.5 flex items-center justify-between text-xs font-semibold shadow-inner border-b border-blue-800">
+                  <div className="flex items-center gap-2">
+                    <ShoppingBag className="w-4 h-4 text-blue-300" />
+                    <span>معاينة بوابة الصيدليات المباشرة • رابط طلب الأدوية للصيدليات</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => navigateToView('warehouse')}
+                    className="bg-white/15 hover:bg-white/25 px-3 py-1 rounded-lg text-white font-bold transition flex items-center gap-1.5 cursor-pointer text-xs"
+                  >
+                    <span>العودة للوحة الإدارة</span>
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+                <PharmacyPortal
+                  products={products}
+                  cart={cart}
+                  orders={orders}
+                  onAddToCart={handleAddToCart}
+                  onUpdateCartQuantity={handleUpdateCartQuantity}
+                  onRemoveFromCart={handleRemoveFromCart}
+                  onClearCart={handleClearCart}
+                  onSubmitOrder={handleSubmitOrder}
+                  settings={settings}
+                  prefilledPharmacyName={prefilledPharmacyName}
+                  currentUser={currentUser}
+                  onOpenAuth={() => setIsAuthModalOpen(true)}
+                  onDeleteOrder={handleDeleteOrder}
+                  onDeleteOrdersBulk={handleDeleteOrdersBulk}
+                  onLogout={async () => {
+                    await signOutFirebase();
+                    localStorage.removeItem('samo_user_session');
+                    setCurrentUser(null);
+                    storage.setCurrentUser(null);
+                    setIsAuthModalOpen(true);
+                  }}
+                  onSwitchToWarehouse={() => navigateToView('warehouse')}
+                  onUpdateSettings={(newSettings) => setSettings(newSettings)}
+                />
+              </div>
+            )}
+
+            {(visitedViews.has('inventory') || currentView === 'inventory') && (
+              <div className={currentView === 'inventory' ? 'block' : 'hidden'} key="view-inventory">
+                <InventoryManager
+                  products={products}
+                  onAddProduct={handleAddProduct}
+                  onBatchAddProducts={handleBatchAddProducts}
+                  onUpdateProduct={handleUpdateProduct}
+                  onDeleteProduct={handleDeleteProduct}
+                  settings={settings}
+                  initialFilter={inventoryInitialFilter}
+                />
+              </div>
+            )}
+
+            {(visitedViews.has('add_materials') || currentView === 'add_materials') && (
+              <div className={currentView === 'add_materials' ? 'block' : 'hidden'} key="view-add_materials">
+                <AddMaterialsPage
+                  products={products}
+                  onAddProduct={handleAddProduct}
+                  onBatchAddProducts={handleBatchAddProducts}
+                  onNavigateBack={() => navigateToView('inventory')}
+                  settings={settings}
+                />
+              </div>
+            )}
+
+            {(visitedViews.has('financial_reports') || currentView === 'financial_reports') && (
+              <div className={currentView === 'financial_reports' ? 'block' : 'hidden'} key="view-financial_reports">
+                <FinancialReportsPage
+                  products={products}
+                  orders={orders}
+                  settings={settings}
+                  onNavigateBack={() => navigateToView('warehouse')}
+                  onNavigateToInventoryWithFilter={handleNavigateToInventoryWithFilter}
+                />
+              </div>
+            )}
+          </React.Suspense>
         </main>
       </div>
 
@@ -1564,16 +2569,65 @@ export default function App() {
               </button>
 
               <button
-                onClick={() => navigateToView('warehouse')}
-                className="w-full text-slate-300 hover:text-white hover:bg-slate-800 px-3.5 py-2.5 rounded-xl flex items-center gap-3 cursor-pointer text-sm font-semibold transition"
+                onClick={() => {
+                  setWarehouseInitialTab('new');
+                  navigateToView('warehouse');
+                  setIsMobileMenuOpen(false);
+                }}
+                className={`w-full px-3.5 py-2.5 rounded-xl flex items-center gap-3 cursor-pointer text-sm font-semibold transition ${
+                  currentView === 'warehouse' && warehouseInitialTab === 'new'
+                    ? 'bg-blue-600 text-white shadow-xs'
+                    : 'text-slate-300 hover:text-white hover:bg-slate-800'
+                }`}
               >
-                <Receipt className="w-5 h-5 shrink-0 text-purple-400" />
+                <Receipt className="w-5 h-5 shrink-0 text-red-400" />
                 <span>الطلبات الواردة</span>
                 {newOrdersCount > 0 && (
                   <span className="mr-auto bg-red-500 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">
                     {newOrdersCount}
                   </span>
                 )}
+              </button>
+
+              <button
+                onClick={() => {
+                  setWarehouseInitialTab('ready');
+                  navigateToView('warehouse');
+                  setIsMobileMenuOpen(false);
+                }}
+                className={`w-full px-3.5 py-2.5 rounded-xl flex items-center gap-3 cursor-pointer text-sm font-semibold transition ${
+                  currentView === 'warehouse' && warehouseInitialTab === 'ready'
+                    ? 'bg-blue-600 text-white shadow-xs'
+                    : 'text-slate-300 hover:text-white hover:bg-slate-800'
+                }`}
+              >
+                <PackageCheck className="w-5 h-5 shrink-0 text-blue-400" />
+                <span>الطلبات المجهزة</span>
+                {orders.filter(o => o.status === 'ready').length > 0 && (
+                  <span className="mr-auto bg-blue-500 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">
+                    {orders.filter(o => o.status === 'ready').length}
+                  </span>
+                )}
+              </button>
+
+              <button
+                id="mobile-nav-approved-dispatched-registry"
+                onClick={() => {
+                  setWarehouseInitialTab('approved_dispatched');
+                  navigateToView('warehouse');
+                  setIsMobileMenuOpen(false);
+                }}
+                className={`w-full px-3.5 py-2.5 rounded-xl flex items-center gap-3 cursor-pointer text-sm font-semibold transition ${
+                  currentView === 'warehouse' && warehouseInitialTab === 'approved_dispatched'
+                    ? 'bg-indigo-600 text-white shadow-xs font-bold'
+                    : 'text-indigo-300 hover:text-white hover:bg-slate-800'
+                }`}
+              >
+                <FileText className="w-5 h-5 shrink-0 text-indigo-400" />
+                <span>سجل الصادر والمعتمد</span>
+                <span className="mr-auto bg-indigo-500/20 text-indigo-200 text-[10px] font-bold px-2 py-0.5 rounded-full border border-indigo-500/30">
+                  مع التاريخ
+                </span>
               </button>
 
               <button
@@ -1600,7 +2654,7 @@ export default function App() {
                 <span>روابط السلات ومشاركتها</span>
               </button>
 
-              {(currentUser?.role === 'owner' || currentUser?.role === 'super_admin' || currentUser?.founder || currentUser?.role === 'warehouse_manager') && (
+              {(currentUser?.role === 'owner' || currentUser?.role === 'super_admin' || currentUser?.role === 'founder' || currentUser?.role === 'warehouse' || currentUser?.founder || currentUser?.role === 'warehouse_manager' || currentUser?.role === 'staff' || currentUser?.role === 'pharmacist_staff') && (
                 <button
                   onClick={() => {
                     setIsApprovalsModalOpen(true);
@@ -1626,11 +2680,24 @@ export default function App() {
                   <div className="text-xs">
                     <p className="font-bold text-white truncate max-w-[170px]">{currentUser.pharmacyName || currentUser.name}</p>
                     <p className="text-[10px] text-emerald-400 font-medium">
-                      {currentUser.role === 'super_admin' ? 'المدير الأعلى' : currentUser.role === 'owner' ? 'صاحب المذخر' : currentUser.role === 'warehouse_manager' ? 'مدير المستودع' : 'صيدلية معتمدة'}
+                      {currentUser.role === 'founder' || currentUser.founder
+                        ? 'المؤسس والمدير الأعلى'
+                        : currentUser.role === 'warehouse' || currentUser.role === 'owner'
+                        ? 'صاحب مذخر'
+                        : currentUser.role === 'super_admin'
+                        ? 'المدير الأعلى'
+                        : currentUser.role === 'warehouse_manager'
+                        ? 'مدير المستودع'
+                        : currentUser.role === 'staff' || currentUser.role === 'pharmacist_staff'
+                        ? 'كادر المذخر'
+                        : currentUser.role === 'auditor_readonly'
+                        ? 'مدقق حسابات'
+                        : 'صيدلية معتمدة'}
                     </p>
                   </div>
                   <button
-                    onClick={() => {
+                    onClick={async () => {
+                      await signOutFirebase();
                       setCurrentUser(null);
                       storage.setCurrentUser(null);
                       setIsMobileMenuOpen(false);
@@ -1667,15 +2734,19 @@ export default function App() {
       )}
 
       {/* Share Link Modal */}
-      <ShareLinkModal
-        isOpen={isShareModalOpen}
-        onClose={() => setIsShareModalOpen(false)}
-        settings={settings}
-        onOpenPharmacyView={(pharmacyName) => {
-          if (pharmacyName) setPrefilledPharmacyName(pharmacyName);
-          navigateToView('pharmacy');
-        }}
-      />
+      {isShareModalOpen && (
+        <React.Suspense fallback={null}>
+          <ShareLinkModal
+            isOpen={isShareModalOpen}
+            onClose={() => setIsShareModalOpen(false)}
+            settings={settings}
+            onOpenPharmacyView={(pharmacyName) => {
+              if (pharmacyName) setPrefilledPharmacyName(pharmacyName);
+              navigateToView('pharmacy');
+            }}
+          />
+        </React.Suspense>
+      )}
 
       {/* Authentication & Access Gate Modal */}
       <AuthModal
@@ -1708,99 +2779,109 @@ export default function App() {
       />
 
       {/* User Approvals Management Modal for Warehouse Owner */}
-      <UserApprovalsModal
-        isOpen={isApprovalsModalOpen}
-        onClose={() => setIsApprovalsModalOpen(false)}
-        users={registeredUsers}
-        onRefreshUsers={syncServerUsers}
-        onApproveUser={async (userId, role) => {
-          const user = storage.updateUserStatus(userId, 'approved', role);
-          if (user) {
-            setRegisteredUsers(storage.getRegisteredUsers());
-            if (isOnline) {
-              fetch('/api/auth/approve', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ userId, role }),
-              }).catch(() => {});
-            }
-          }
-        }}
-        onRejectUser={async (userId) => {
-          const user = storage.updateUserStatus(userId, 'rejected');
-          if (user) {
-            setRegisteredUsers(storage.getRegisteredUsers());
-            if (isOnline) {
-              fetch('/api/auth/reject', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ userId }),
-              }).catch(() => {});
-            }
-          }
-        }}
-        onUpdateUser={async (updatedUser) => {
-          const updated = registeredUsers.map((u) => (u.id === updatedUser.id ? updatedUser : u));
-          setRegisteredUsers(updated);
-          storage.saveRegisteredUsers(updated);
-          if (currentUser?.id === updatedUser.id) {
-            setCurrentUser(updatedUser);
-            storage.setCurrentUser(updatedUser);
-          }
-          if (isOnline) {
-            fetch('/api/auth/register', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(updatedUser),
-            }).catch(() => {});
-          }
-        }}
-        onDeleteUser={async (userId) => {
-          const userToDelete = registeredUsers.find((u) => u.id === userId);
-          if (userToDelete) {
-            storage.recordDeletedUser(userToDelete.id, userToDelete.identifier, userToDelete.pharmacyName);
-          }
-          storage.deleteUser(userId);
-          const remaining = registeredUsers.filter((u) => u.id !== userId);
-          setRegisteredUsers(remaining);
-          if (currentUser && (currentUser.id === userId || (userToDelete && currentUser.identifier.toLowerCase() === userToDelete.identifier.toLowerCase()))) {
-            setCurrentUser(null);
-            storage.setCurrentUser(null);
-            storage.clearPharmacyProfile();
-            setCart([]);
-            setAuthModalCustomMessage('تم حذف تصريح حسابك من قبل إدارة المذخر • تم منع الوصول إلى السلة والكتالوج حتى بعد تغيير الرابط.');
-            setIsAuthModalOpen(true);
-          }
-          if (isOnline) {
-            fetch(`/api/auth/users/${userId}`, { method: 'DELETE' }).catch(() => {});
-          }
-        }}
-        onAddPreApprovedUser={async (userData) => {
-          const newUser: AppUser = {
-            ...userData,
-            id: `user-${Date.now()}`,
-            createdAt: new Date().toISOString(),
-          };
-          const updated = [newUser, ...registeredUsers];
-          setRegisteredUsers(updated);
-          storage.saveRegisteredUsers(updated);
-          if (isOnline) {
-            fetch('/api/auth/register', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(newUser),
-            }).then(() => {
-              fetch('/api/auth/approve', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ userId: newUser.id }),
-              }).catch(() => {});
-            }).catch(() => {});
-          }
-        }}
-        settings={settings}
-        onUpdateSettings={(newSettings) => setSettings(newSettings)}
-      />
+      {isApprovalsModalOpen && (
+        <React.Suspense fallback={null}>
+          <UserApprovalsModal
+            isOpen={isApprovalsModalOpen}
+            onClose={() => setIsApprovalsModalOpen(false)}
+            users={registeredUsers}
+            onRefreshUsers={syncServerUsers}
+            onApproveUser={async (userId, role) => {
+              setNewRegistrationAlert((curr) =>
+                curr && (curr.id === userId || curr.identifier === userId) ? null : curr
+              );
+              const user = storage.updateUserStatus(userId, 'approved', role);
+              if (user) {
+                setRegisteredUsers(storage.getRegisteredUsers());
+                if (isOnline) {
+                  fetch('/api/auth/approve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ userId, role }),
+                  }).catch(() => {});
+                }
+              }
+            }}
+            onRejectUser={async (userId) => {
+              setNewRegistrationAlert((curr) =>
+                curr && (curr.id === userId || curr.identifier === userId) ? null : curr
+              );
+              const user = storage.updateUserStatus(userId, 'rejected');
+              if (user) {
+                setRegisteredUsers(storage.getRegisteredUsers());
+                if (isOnline) {
+                  fetch('/api/auth/reject', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ userId }),
+                  }).catch(() => {});
+                }
+              }
+            }}
+            onUpdateUser={async (updatedUser) => {
+              const updated = registeredUsers.map((u) => (u.id === updatedUser.id ? updatedUser : u));
+              setRegisteredUsers(updated);
+              storage.saveRegisteredUsers(updated);
+              if (currentUser?.id === updatedUser.id) {
+                setCurrentUser(updatedUser);
+                storage.setCurrentUser(updatedUser);
+              }
+              if (isOnline) {
+                fetch('/api/auth/register', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(updatedUser),
+                }).catch(() => {});
+              }
+            }}
+            onDeleteUser={async (userId) => {
+              const userToDelete = registeredUsers.find((u) => u.id === userId);
+              if (userToDelete) {
+                storage.recordDeletedUser(userToDelete.id, userToDelete.identifier, userToDelete.pharmacyName);
+              }
+              storage.deleteUser(userId);
+              const remaining = registeredUsers.filter((u) => u.id !== userId);
+              setRegisteredUsers(remaining);
+              if (currentUser && (currentUser.id === userId || (userToDelete && currentUser.identifier.toLowerCase() === userToDelete.identifier.toLowerCase()))) {
+                setCurrentUser(null);
+                storage.setCurrentUser(null);
+                storage.clearPharmacyProfile();
+                setCart([]);
+                setAuthModalCustomMessage('تم حذف تصريح حسابك من قبل إدارة المذخر • تم منع الوصول إلى السلة والكتالوج حتى بعد تغيير الرابط.');
+                setIsAuthModalOpen(true);
+              }
+              if (isOnline) {
+                fetch(`/api/auth/users/${userId}`, { method: 'DELETE' }).catch(() => {});
+              }
+            }}
+            onAddPreApprovedUser={async (userData) => {
+              const newUser: AppUser = {
+                ...userData,
+                id: `user-${Date.now()}`,
+                createdAt: new Date().toISOString(),
+              };
+              const updated = [newUser, ...registeredUsers];
+              setRegisteredUsers(updated);
+              storage.saveRegisteredUsers(updated);
+              if (isOnline) {
+                fetch('/api/auth/register', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(newUser),
+                }).then(() => {
+                  fetch('/api/auth/approve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ userId: newUser.id }),
+                  }).catch(() => {});
+                }).catch(() => {});
+              }
+            }}
+            settings={settings}
+            onUpdateSettings={(newSettings) => setSettings(newSettings)}
+          />
+        </React.Suspense>
+      )}
 
       {/* Offline Status Floating Alert Indicator */}
       <OfflineIndicator />
@@ -1818,14 +2899,24 @@ export default function App() {
                 <Bell className="w-4 h-4 text-amber-400 animate-bounce" />
               </div>
               <div>
-                <h3 className="font-bold text-sm text-white leading-tight">طلب تسجيل جديد بانتظار الموافقة!</h3>
-                <p className="text-[10px] text-amber-300/90 font-medium">تم تسجيل مستخدم جديد من جهاز آخر ويحتاج تصريحك</p>
+                <h3 className="font-bold text-sm text-white leading-tight">يوجد طلب تسجيل جديد قيد الانتظار</h3>
+                <p className="text-[10px] text-amber-300/90 font-medium">وصل طلب انضمام جديد ويحتاج اعتمادك من لوحة الإدارة</p>
               </div>
             </div>
             <button 
-              onClick={() => setNewRegistrationAlert(null)} 
+              onClick={() => {
+                if (newRegistrationAlert) {
+                  storage.markAlertHandled(
+                    newRegistrationAlert.id,
+                    newRegistrationAlert.identifier,
+                    newRegistrationAlert.phone,
+                    newRegistrationAlert.email
+                  );
+                }
+                setNewRegistrationAlert(null);
+              }} 
               className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
-              title="إغلاق التنبيه"
+              title="إغلاق التنبيه نهائياً"
             >
               <X className="w-4 h-4" />
             </button>
@@ -1852,23 +2943,102 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              id="btn-alert-approve-registration"
+              onClick={async () => {
+                const targetUser = newRegistrationAlert;
+                if (!targetUser) return;
+                storage.markAlertHandled(targetUser.id, targetUser.identifier, targetUser.phone, targetUser.email);
+                setNewRegistrationAlert(null);
+                const role = targetUser.registrationAccountType === 'warehouse_staff' ? 'pharmacist_staff' : 'pharmacy';
+                const user = storage.updateUserStatus(targetUser.id, 'approved', role);
+                if (user) {
+                  setRegisteredUsers(storage.getRegisteredUsers());
+                  if (isOnline) {
+                    fetch('/api/auth/approve', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        userId: targetUser.id,
+                        identifier: targetUser.identifier,
+                        phone: targetUser.phone,
+                        email: targetUser.email,
+                        role,
+                      }),
+                    }).catch(() => {});
+                  }
+                }
+              }}
+              className="flex-1 min-w-[100px] bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-2 px-3 rounded-xl text-xs flex items-center justify-center gap-1.5 shadow-md transition cursor-pointer active:scale-95"
+            >
+              <CheckCircle className="w-4 h-4 text-white" />
+              <span>قبول واعتماد</span>
+            </button>
+            <button
+              id="btn-alert-reject-registration"
+              onClick={async () => {
+                const targetUser = newRegistrationAlert;
+                if (!targetUser) return;
+                storage.markAlertHandled(targetUser.id, targetUser.identifier, targetUser.phone, targetUser.email);
+                setNewRegistrationAlert(null);
+                const user = storage.updateUserStatus(targetUser.id, 'rejected');
+                if (user) {
+                  setRegisteredUsers(storage.getRegisteredUsers());
+                  if (isOnline) {
+                    fetch('/api/auth/reject', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        userId: targetUser.id,
+                        identifier: targetUser.identifier,
+                        phone: targetUser.phone,
+                        email: targetUser.email,
+                      }),
+                    }).catch(() => {});
+                  }
+                }
+              }}
+              className="bg-rose-600 hover:bg-rose-500 text-white font-bold py-2 px-3 rounded-xl text-xs flex items-center justify-center gap-1.5 shadow-md transition cursor-pointer active:scale-95"
+            >
+              <XCircle className="w-4 h-4 text-white" />
+              <span>رفض</span>
+            </button>
             <button
               id="btn-alert-review-registration"
               onClick={() => {
+                if (newRegistrationAlert) {
+                  storage.markAlertHandled(
+                    newRegistrationAlert.id,
+                    newRegistrationAlert.identifier,
+                    newRegistrationAlert.phone,
+                    newRegistrationAlert.email
+                  );
+                }
                 setIsApprovalsModalOpen(true);
                 setNewRegistrationAlert(null);
               }}
-              className="flex-1 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold py-2 px-3 rounded-xl text-xs flex items-center justify-center gap-1.5 shadow-md transition cursor-pointer active:scale-95"
+              className="bg-slate-800 hover:bg-slate-700 text-slate-300 py-2 px-2.5 rounded-xl text-xs font-semibold transition cursor-pointer"
+              title="عرض التفاصيل الكاملة"
             >
-              <ShieldCheck className="w-4 h-4 text-slate-950" />
-              <span>مراجعة واعتماد الطلب فوراً</span>
+              مراجعة
             </button>
             <button
-              onClick={() => setNewRegistrationAlert(null)}
-              className="bg-slate-800 hover:bg-slate-700 text-slate-300 py-2 px-3 rounded-xl text-xs font-semibold transition cursor-pointer"
+              onClick={() => {
+                if (newRegistrationAlert) {
+                  storage.markAlertHandled(
+                    newRegistrationAlert.id,
+                    newRegistrationAlert.identifier,
+                    newRegistrationAlert.phone,
+                    newRegistrationAlert.email
+                  );
+                }
+                setNewRegistrationAlert(null);
+              }}
+              className="bg-slate-800 hover:bg-slate-700 text-slate-400 py-2 px-2 rounded-xl text-xs transition cursor-pointer"
+              title="إغلاق التنبيه نهائياً"
             >
-              إغلاق
+              <X className="w-4 h-4" />
             </button>
           </div>
         </div>

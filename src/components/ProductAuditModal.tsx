@@ -160,7 +160,7 @@ export const ProductAuditModal: React.FC<ProductAuditModalProps> = ({
                     <div className="flex items-center gap-2">
                       {getActionBadge(log.actionType)}
                       <span className="text-xs text-slate-400 font-mono" dir="ltr">
-                        {new Date(log.timestamp).toLocaleString('ar-IQ')}
+                        {log.timestamp ? new Date(log.timestamp).toLocaleString('ar-IQ') : '—'}
                       </span>
                     </div>
 

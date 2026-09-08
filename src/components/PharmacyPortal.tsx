@@ -35,11 +35,18 @@ import {
   ClipboardList,
   Clock,
   Layers,
-  LayoutDashboard
+  LayoutDashboard,
+  ChevronDown,
+  MapPin,
+  PlusCircle,
+  Trash2,
+  Camera
 } from 'lucide-react';
-import { Product, CartItem, Order, WarehouseSettings, calculateMeltedPrice, AppUser } from '../types';
+import { Product, CartItem, Order, WarehouseSettings, calculateMeltedPrice, AppUser, UserPharmacyBranch } from '../types';
 import { storage } from '../services/storage';
 import { EditContactModal } from './EditContactModal';
+import { AddPharmacyBranchModal } from './AddPharmacyBranchModal';
+import { CameraBarcodeScannerModal } from './CameraBarcodeScannerModal';
 
 interface PharmacyPortalProps {
   products: Product[];
@@ -62,6 +69,9 @@ interface PharmacyPortalProps {
   onUpdateSettings?: (newSettings: WarehouseSettings) => void;
   currentUser?: AppUser | null;
   onLogout?: () => void;
+  onOpenAuth?: () => void;
+  onDeleteOrder?: (orderId: string) => Promise<void> | void;
+  onDeleteOrdersBulk?: (orderIds: string[]) => Promise<void> | void;
 }
 
 export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
@@ -79,6 +89,9 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
   onUpdateSettings,
   currentUser,
   onLogout,
+  onOpenAuth,
+  onDeleteOrder,
+  onDeleteOrdersBulk,
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
@@ -88,9 +101,11 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
   const [completedOrder, setCompletedOrder] = useState<Order | null>(null);
   const [selectedOrderForPrint, setSelectedOrderForPrint] = useState<Order | null>(null);
   const [copiedInvoiceText, setCopiedInvoiceText] = useState(false);
+  const [cartAccessWarning, setCartAccessWarning] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<'cards' | 'table'>('cards');
   const [isEditingProfile, setIsEditingProfile] = useState(false);
   const [isEditContactOpen, setIsEditContactOpen] = useState(false);
+  const [isBarcodeScannerOpen, setIsBarcodeScannerOpen] = useState(false);
   const [activePortalTab, setActivePortalTab] = useState<'catalog' | 'order_history'>('catalog');
   const [orderStatusFilter, setOrderStatusFilter] = useState<'all' | 'pending' | 'ready' | 'completed'>('all');
 
@@ -114,6 +129,74 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
   const [formErrors, setFormErrors] = useState<{ [key: string]: string }>({});
   const [hasProfileSaved, setHasProfileSaved] = useState(() => Boolean((prefilledPharmacyName || savedProfile.name) && savedProfile.pharmacist));
 
+  // Multi-Pharmacy Management (same phone number can have multiple pharmacy branches)
+  const userPhone = useMemo(() => {
+    return (phone || currentUser?.phone || currentUser?.identifier || savedProfile.phone || '').trim();
+  }, [phone, currentUser, savedProfile.phone]);
+
+  const [pharmacyBranches, setPharmacyBranches] = useState<UserPharmacyBranch[]>(() => {
+    const initialPhone = (savedProfile.phone || currentUser?.phone || currentUser?.identifier || '').trim();
+    return storage.getPharmaciesForPhone(initialPhone);
+  });
+
+  const [isAddBranchModalOpen, setIsAddBranchModalOpen] = useState(false);
+  const [isBranchDropdownOpen, setIsBranchDropdownOpen] = useState(false);
+  const [selectedPharmacyFilter, setSelectedPharmacyFilter] = useState<string>('all');
+
+  const refreshBranches = () => {
+    const currentP = (phone || currentUser?.phone || currentUser?.identifier || savedProfile.phone || '').trim();
+    const branches = storage.getPharmaciesForPhone(currentP);
+    setPharmacyBranches(branches);
+  };
+
+  useEffect(() => {
+    if (userPhone) {
+      refreshBranches();
+    }
+  }, [userPhone, currentUser]);
+
+  const handleSelectPharmacyBranch = (branch: UserPharmacyBranch) => {
+    setPharmacyName(branch.name);
+    if (branch.pharmacistName) setPharmacistName(branch.pharmacistName);
+    if (branch.phone) setPhone(branch.phone);
+    if (branch.address) setAddress(branch.address);
+    storage.setActivePharmacyForPhone(branch.phone || userPhone, branch.id);
+    setIsBranchDropdownOpen(false);
+    refreshBranches();
+  };
+
+  const handleAddNewBranch = (branchData: {
+    name: string;
+    pharmacistName: string;
+    address: string;
+    notes?: string;
+  }) => {
+    const targetPhone = userPhone || phone || currentUser?.phone || currentUser?.identifier || '';
+    const newBranch = storage.savePharmacyForPhone(targetPhone, {
+      name: branchData.name,
+      pharmacistName: branchData.pharmacistName,
+      phone: targetPhone,
+      address: branchData.address,
+      notes: branchData.notes,
+    });
+
+    fetch('/api/auth/add-pharmacy-branch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        phone: targetPhone,
+        pharmacyName: branchData.name,
+        pharmacistName: branchData.pharmacistName,
+        address: branchData.address,
+        notes: branchData.notes,
+      }),
+    }).catch(() => {});
+
+    handleSelectPharmacyBranch(newBranch);
+    setHasProfileSaved(true);
+    setIsEditingProfile(false);
+  };
+
   // Stored list of order IDs submitted from this pharmacy browser session
   const [myOrderIds, setMyOrderIds] = useState<string[]>(() => {
     try {
@@ -124,18 +207,26 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
     }
   });
 
-  // Track all orders corresponding to this pharmacy
+  // Track all orders corresponding to this pharmacy / employee's branches
   const myOrders = useMemo(() => {
     if (!orders || orders.length === 0) return [];
+    const branchNames = pharmacyBranches.map((b) => b.name.trim().toLowerCase());
     return orders.filter((o) => {
       const matchId = myOrderIds.includes(o.id);
-      const matchName = Boolean(
-        pharmacyName.trim() &&
-        o.pharmacyName.trim().toLowerCase() === pharmacyName.trim().toLowerCase()
-      );
-      return matchId || matchName;
+      const oPharmLower = (o.pharmacyName || '').trim().toLowerCase();
+      const matchCurrentName = Boolean(pharmacyName.trim() && oPharmLower === pharmacyName.trim().toLowerCase());
+      const matchAnyBranch = branchNames.includes(oPharmLower);
+      const matchPhone = Boolean(userPhone && o.phone && o.phone.replace(/[^0-9]/g, '') === userPhone.replace(/[^0-9]/g, ''));
+
+      const belongsToThisUser = matchId || matchCurrentName || matchAnyBranch || matchPhone;
+      if (!belongsToThisUser) return false;
+
+      if (selectedPharmacyFilter !== 'all') {
+        return oPharmLower === selectedPharmacyFilter.trim().toLowerCase();
+      }
+      return true;
     });
-  }, [orders, myOrderIds, pharmacyName]);
+  }, [orders, myOrderIds, pharmacyName, pharmacyBranches, userPhone, selectedPharmacyFilter]);
 
   // Specific item unavailability alerts ("تعذر تجهيز المنتج الفلاني")
   const unavailableAlerts = useMemo(() => {
@@ -154,13 +245,13 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
   const filteredOrdersHistory = useMemo(() => {
     if (orderStatusFilter === 'all') return myOrders;
     if (orderStatusFilter === 'pending') {
-      return myOrders.filter((o) => o.status === 'new' || o.status === 'pending');
+      return myOrders.filter((o) => o.status === 'new' || (o.status as string) === 'pending');
     }
     if (orderStatusFilter === 'ready') {
       return myOrders.filter((o) => o.status === 'ready' || o.status === 'preparing');
     }
     if (orderStatusFilter === 'completed') {
-      return myOrders.filter((o) => o.status === 'completed');
+      return myOrders.filter((o) => o.status === 'delivered' || (o.status as string) === 'completed');
     }
     return myOrders;
   }, [myOrders, orderStatusFilter]);
@@ -172,9 +263,102 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
     return orders.find(
       (o) =>
         o.pharmacyName.trim().toLowerCase() === currentPharm &&
-        (o.status === 'new' || o.status === 'pending')
+        (o.status === 'new' || (o.status as string) === 'pending')
     );
   }, [orders, pharmacyName, currentUser?.pharmacyName]);
+
+  // Pending orders in this pharmacy
+  const pendingOrdersList = useMemo(() => {
+    return myOrders.filter((o) => o.status === 'new' || (o.status as string) === 'pending');
+  }, [myOrders]);
+
+  const [orderToDelete, setOrderToDelete] = useState<Order | null>(null);
+  const [showDeleteAllPendingModal, setShowDeleteAllPendingModal] = useState(false);
+  const [isDeletingOrder, setIsDeletingOrder] = useState(false);
+  const [deleteOrderFeedback, setDeleteOrderFeedback] = useState<string | null>(null);
+
+  const removeOrderFromLocalTracking = (orderId: string) => {
+    setMyOrderIds((prev) => {
+      const next = prev.filter((id) => id !== orderId);
+      try {
+        localStorage.setItem('samo_pharmacy_my_orders_v3', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  };
+
+  const removeOrdersFromLocalTracking = (orderIds: string[]) => {
+    const idSet = new Set(orderIds);
+    setMyOrderIds((prev) => {
+      const next = prev.filter((id) => !idSet.has(id));
+      try {
+        localStorage.setItem('samo_pharmacy_my_orders_v3', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  };
+
+  // Confirm delete single pending order
+  const handleConfirmDeleteSingleOrder = async () => {
+    if (!orderToDelete) return;
+    const orderId = orderToDelete.id;
+    const orderNum = orderToDelete.orderNumber;
+    setIsDeletingOrder(true);
+    try {
+      if (onDeleteOrder) {
+        await onDeleteOrder(orderId);
+      } else {
+        storage.deleteOrder(orderId);
+        if (navigator.onLine) {
+          fetch(`/api/orders/${orderId}`, { method: 'DELETE' }).catch(() => {});
+        }
+      }
+      removeOrderFromLocalTracking(orderId);
+      setDeleteOrderFeedback(`تم حذف وإلغاء الطلب المعلق (${orderNum}) بنجاح.`);
+      setTimeout(() => setDeleteOrderFeedback(null), 4000);
+    } catch (err) {
+      console.error('Failed to delete pending order:', err);
+    } finally {
+      setIsDeletingOrder(false);
+      setOrderToDelete(null);
+    }
+  };
+
+  // Confirm delete all pending orders
+  const handleConfirmDeleteAllPendingOrders = async () => {
+    if (pendingOrdersList.length === 0) {
+      setShowDeleteAllPendingModal(false);
+      return;
+    }
+    const pendingIds = pendingOrdersList.map((o) => o.id);
+    const count = pendingIds.length;
+    setIsDeletingOrder(true);
+    try {
+      if (onDeleteOrdersBulk) {
+        await onDeleteOrdersBulk(pendingIds);
+      } else {
+        storage.deleteOrders(pendingIds);
+        if (navigator.onLine) {
+          fetch('/api/orders/bulk-delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids: pendingIds }),
+          }).catch(() => {});
+        }
+        pendingIds.forEach((id) => {
+          if (onDeleteOrder) onDeleteOrder(id);
+        });
+      }
+      removeOrdersFromLocalTracking(pendingIds);
+      setDeleteOrderFeedback(`تم حذف جميع الطلبات المعلقة (${count} طلبية) بنجاح.`);
+      setTimeout(() => setDeleteOrderFeedback(null), 4000);
+    } catch (err) {
+      console.error('Failed to delete all pending orders:', err);
+    } finally {
+      setIsDeletingOrder(false);
+      setShowDeleteAllPendingModal(false);
+    }
+  };
 
   // Sync shared cart with other colleagues of the same pharmacy
   useEffect(() => {
@@ -242,24 +426,56 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
   }, [isBlocked, onLogout, onClearCart]);
 
   const handleOpenCart = () => {
-    if (isBlocked) {
+    if (isBlocked || currentUser?.status === 'blocked') {
       storage.setCurrentUser(null);
       storage.clearPharmacyProfile();
       onClearCart();
       onLogout?.();
+      alert('تم إلغاء صلاحية الوصول إلى النظام');
       return;
     }
+    if (!currentUser) {
+      setCartAccessWarning('يرجى تسجيل الدخول للطلب');
+      onOpenAuth?.();
+      return;
+    }
+    if (currentUser.status === 'pending') {
+      setCartAccessWarning('حساب الصيدلية قيد التدقيق والمراجعة من قبل إدارة المذخر، يرجى الانتظار حتى يتم الاعتماد.');
+      return;
+    }
+    if (currentUser.status !== 'approved') {
+      setCartAccessWarning('يرجى تسجيل الدخول بحساب صيدلية معتمد للطلب');
+      onOpenAuth?.();
+      return;
+    }
+    setCartAccessWarning(null);
     setIsCartOpen(true);
   };
 
   const handleAddToCartSecure = (product: Product, quantity = 1) => {
-    if (isBlocked) {
+    if (isBlocked || currentUser?.status === 'blocked') {
       storage.setCurrentUser(null);
       storage.clearPharmacyProfile();
       onClearCart();
       onLogout?.();
+      alert('تم إلغاء صلاحية الوصول إلى النظام');
       return;
     }
+    if (!currentUser) {
+      setCartAccessWarning('يرجى تسجيل الدخول للطلب');
+      onOpenAuth?.();
+      return;
+    }
+    if (currentUser.status === 'pending') {
+      setCartAccessWarning('حساب الصيدلية قيد التدقيق والمراجعة من قبل إدارة المذخر، يرجى الانتظار حتى يتم الاعتماد.');
+      return;
+    }
+    if (currentUser.status !== 'approved') {
+      setCartAccessWarning('يرجى تسجيل الدخول بحساب صيدلية معتمد للطلب');
+      onOpenAuth?.();
+      return;
+    }
+    setCartAccessWarning(null);
     onAddToCart(product, quantity);
   };
 
@@ -369,6 +585,21 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
 
   const handleCheckoutSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!currentUser) {
+      alert('يرجى تسجيل الدخول للطلب');
+      onOpenAuth?.();
+      return;
+    }
+    if (currentUser.status === 'pending') {
+      alert('حساب الصيدلية قيد التدقيق والمراجعة من قبل إدارة المذخر، لا يمكن إرسال طلبيات حالياً.');
+      return;
+    }
+    if (currentUser.status !== 'approved') {
+      alert('تم إلغاء صلاحية الوصول إلى النظام');
+      onLogout?.();
+      return;
+    }
+
     const errors: { [key: string]: string } = {};
     if (!pharmacyName.trim()) errors.pharmacyName = 'اسم الصيدلية مطلوب';
     if (!pharmacistName.trim()) errors.pharmacistName = 'اسم الموظف / الصيدلي مطلوب';
@@ -389,6 +620,13 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
         phone: phone.trim(),
         address: address.trim(),
       });
+      storage.savePharmacyForPhone(phone.trim() || userPhone, {
+        name: pharmacyName.trim(),
+        pharmacistName: pharmacistName.trim(),
+        phone: phone.trim() || userPhone,
+        address: address.trim(),
+      });
+      refreshBranches();
       const order = await onSubmitOrder({
         pharmacyName,
         pharmacistName,
@@ -595,15 +833,28 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
             </form>
           </div>
         ) : (
-          <div className="bg-white rounded-xl border border-slate-200/80 px-4 py-2.5 shadow-xs flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2.5 text-xs">
+          <div className="bg-white rounded-xl border border-slate-200/80 px-4 py-2.5 shadow-xs flex flex-wrap items-center justify-between gap-3 relative">
+            <div className="flex items-center flex-wrap gap-2.5 text-xs">
               <div className="w-7 h-7 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center justify-center font-bold shrink-0">
                 <Building className="w-3.5 h-3.5" />
               </div>
               <div className="flex items-center flex-wrap gap-2">
-                <span className="font-bold text-slate-900">{pharmacyName}</span>
-                <span className="text-slate-300">•</span>
-                <span className="text-slate-600">{pharmacistName}</span>
+                <span className="font-black text-slate-900">{pharmacyName || 'الصيدلية'}</span>
+                {address && (
+                  <>
+                    <span className="text-slate-300">•</span>
+                    <span className="text-slate-600 flex items-center gap-1">
+                      <MapPin className="w-3 h-3 text-slate-400 inline" />
+                      {address}
+                    </span>
+                  </>
+                )}
+                {pharmacistName && (
+                  <>
+                    <span className="text-slate-300">•</span>
+                    <span className="text-slate-600">{pharmacistName}</span>
+                  </>
+                )}
                 {phone && (
                   <>
                     <span className="text-slate-300">•</span>
@@ -613,13 +864,152 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
               </div>
             </div>
 
-            <button
-              onClick={() => setIsEditingProfile(true)}
-              className="flex items-center gap-1 text-[11px] font-semibold text-slate-500 hover:text-blue-600 transition cursor-pointer"
-            >
-              <Edit3 className="w-3 h-3" />
-              <span>تعديل</span>
-            </button>
+            <div className="flex items-center gap-2 relative">
+              {/* Branch Switcher Dropdown */}
+              {pharmacyBranches.length > 1 && (
+                <div className="relative">
+                  <button
+                    type="button"
+                    id="btn-branch-dropdown-toggle"
+                    onClick={() => setIsBranchDropdownOpen(!isBranchDropdownOpen)}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-50 hover:bg-blue-100 active:bg-blue-200 text-blue-700 rounded-xl text-xs font-bold transition cursor-pointer border border-blue-200 shadow-2xs"
+                    title="اختيار الصيدلية الأولى أو الثانية للطلب"
+                  >
+                    <Building className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                    <span>اختيار الصيدلية ({pharmacyBranches.length})</span>
+                    <ChevronDown className={`w-3.5 h-3.5 transition-transform duration-200 ${isBranchDropdownOpen ? 'rotate-180 text-blue-800' : ''}`} />
+                  </button>
+
+                  {isBranchDropdownOpen && (
+                    <>
+                      {/* Backdrop to dismiss when clicking outside */}
+                      <div
+                        className="fixed inset-0 z-40 bg-black/10 sm:bg-transparent"
+                        onClick={() => setIsBranchDropdownOpen(false)}
+                        aria-hidden="true"
+                      />
+
+                      <div
+                        id="dropdown-branch-selector-menu"
+                        className="absolute right-0 sm:right-auto sm:left-0 top-full mt-2 w-[calc(100vw-2rem)] sm:w-84 max-w-[calc(100vw-1.5rem)] bg-white rounded-2xl shadow-2xl border border-slate-200/90 z-50 animate-in fade-in zoom-in-95 duration-100 text-right overflow-hidden ring-1 ring-black/5"
+                      >
+                        {/* Dropdown Header */}
+                        <div className="px-3.5 py-2.5 bg-gradient-to-r from-blue-50/90 to-slate-50 border-b border-slate-100 flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <Building className="w-4 h-4 text-blue-600 shrink-0" />
+                            <div>
+                              <div className="text-xs font-bold text-slate-800 leading-tight">اختيار الصيدلية المعتمدة</div>
+                              <div className="text-[10px] text-slate-500">الصيدليات المسجلة بنفس الرقم</div>
+                            </div>
+                          </div>
+                          <span className="text-[10px] font-bold text-blue-700 bg-blue-100/90 px-2 py-0.5 rounded-full font-mono shrink-0">
+                            {pharmacyBranches.length} صيدليات
+                          </span>
+                        </div>
+
+                        {/* Branches List */}
+                        <div className="max-h-[min(60vh,18rem)] overflow-y-auto p-2 space-y-1.5 overscroll-contain">
+                          {pharmacyBranches.map((b, idx) => {
+                            const isCurrent = b.name.trim().toLowerCase() === pharmacyName.trim().toLowerCase();
+                            const branchLabel = idx === 0 ? 'الصيدلية الأولى' : idx === 1 ? 'الصيدلية الثانية' : `الفرع ${idx + 1}`;
+                            return (
+                              <button
+                                key={b.id}
+                                type="button"
+                                onClick={() => handleSelectPharmacyBranch(b)}
+                                className={`w-full p-2.5 rounded-xl text-right text-xs transition flex items-center justify-between gap-2.5 cursor-pointer border ${
+                                  isCurrent
+                                    ? 'bg-blue-50/90 text-blue-950 font-bold border-blue-300 shadow-2xs ring-1 ring-blue-400/30'
+                                    : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200/80 hover:border-slate-300'
+                                }`}
+                              >
+                                <div className="min-w-0 flex-1 space-y-0.5">
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    <span
+                                      className={`text-[10px] px-1.5 py-0.2 rounded font-bold ${
+                                        idx === 0
+                                          ? 'bg-slate-100 text-slate-700'
+                                          : 'bg-indigo-50 text-indigo-700 border border-indigo-200/60'
+                                      }`}
+                                    >
+                                      {branchLabel}
+                                    </span>
+                                    <span className="font-bold text-xs text-slate-900 truncate">{b.name}</span>
+                                    {isCurrent && (
+                                      <span className="text-[10px] bg-emerald-600 text-white px-1.5 py-0.2 rounded-full font-bold">
+                                        الحالية للطلب
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  {b.address && (
+                                    <div className="text-[11px] text-slate-500 flex items-center gap-1 truncate">
+                                      <MapPin className="w-3 h-3 text-slate-400 shrink-0" />
+                                      <span className="truncate">{b.address}</span>
+                                    </div>
+                                  )}
+
+                                  {b.pharmacistName && (
+                                    <div className="text-[10px] text-slate-400 flex items-center gap-1 truncate">
+                                      <User className="w-3 h-3 text-slate-400 shrink-0" />
+                                      <span className="truncate">المسؤول: {b.pharmacistName}</span>
+                                    </div>
+                                  )}
+                                </div>
+
+                                <div
+                                  className={`w-5 h-5 rounded-full flex items-center justify-center shrink-0 transition-colors ${
+                                    isCurrent
+                                      ? 'bg-blue-600 text-white shadow-xs'
+                                      : 'border border-slate-300 bg-slate-50 text-transparent'
+                                  }`}
+                                >
+                                  <Check className="w-3 h-3 stroke-[3]" />
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+
+                        {/* Add Branch Button at bottom */}
+                        <div className="border-t border-slate-100 p-2 bg-slate-50/60">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setIsBranchDropdownOpen(false);
+                              setIsAddBranchModalOpen(true);
+                            }}
+                            className="w-full py-2 px-3 text-xs font-bold text-blue-600 hover:text-blue-700 bg-blue-50/70 hover:bg-blue-100/80 border border-blue-200/80 rounded-xl transition flex items-center justify-center gap-1.5 cursor-pointer shadow-2xs"
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                            <span>إضافة صيدلية أخرى لنفس الرقم</span>
+                          </button>
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {/* Add Second Pharmacy Button */}
+              <button
+                type="button"
+                onClick={() => setIsAddBranchModalOpen(true)}
+                className="flex items-center gap-1 px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-bold transition cursor-pointer border border-slate-200"
+                title="إضافة صيدلية ثانية بنفس رقم الهاتف"
+              >
+                <Plus className="w-3.5 h-3.5 text-blue-600" />
+                <span>إضافة صيدلية ثانية</span>
+              </button>
+
+              <button
+                onClick={() => setIsEditingProfile(true)}
+                className="flex items-center gap-1 text-[11px] font-semibold text-slate-500 hover:text-blue-600 transition cursor-pointer px-2 py-1 rounded-md hover:bg-slate-50"
+              >
+                <Edit3 className="w-3 h-3" />
+                <span>تعديل</span>
+              </button>
+            </div>
           </div>
         )}
       </div>
@@ -744,25 +1134,49 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
           <div className="w-full max-w-full px-3 sm:px-6 mt-3">
         <div className="bg-white p-3.5 rounded-xl border border-slate-200/80 shadow-xs space-y-3">
           <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-2.5">
-            {/* Search Input */}
-            <div className="relative flex-1">
-              <Search className="w-4 h-4 absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
-              <input
-                id="input-search-pharmacy"
-                type="text"
-                placeholder="بحث باسم الدواء، المادة الفعالة، أو الباركود..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                className="w-full pl-4 pr-10 py-2 bg-slate-50 focus:bg-white border border-slate-200 focus:border-blue-500 rounded-lg text-xs sm:text-sm focus:outline-hidden transition"
-              />
-              {searchTerm && (
-                <button 
-                  onClick={() => setSearchTerm('')}
-                  className="absolute left-3 top-1/2 -translate-y-1/2 text-[11px] text-slate-400 hover:text-slate-600 bg-slate-200 px-1.5 py-0.5 rounded cursor-pointer"
-                >
-                  مسح
-                </button>
-              )}
+            {/* Search Input & Mobile Barcode Scanner */}
+            <div className="relative flex-1 flex items-center gap-2">
+              <div className="relative flex-1">
+                <Search className="w-4 h-4 absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input
+                  id="input-search-pharmacy"
+                  type="text"
+                  placeholder="بحث باسم الدواء، المادة الفعالة، أو الباركود..."
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  className="w-full pl-16 pr-10 py-2 bg-slate-50 focus:bg-white border border-slate-200 focus:border-blue-500 rounded-lg text-xs sm:text-sm focus:outline-hidden transition"
+                />
+                <div className="absolute left-2.5 top-1/2 -translate-y-1/2 flex items-center gap-1.5">
+                  {searchTerm && (
+                    <button 
+                      onClick={() => setSearchTerm('')}
+                      className="text-[11px] text-slate-400 hover:text-slate-600 bg-slate-200 px-1.5 py-0.5 rounded cursor-pointer"
+                    >
+                      مسح
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setIsBarcodeScannerOpen(true)}
+                    className="p-1 text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded-md transition cursor-pointer"
+                    title="مسح الباركود عبر الكاميرا"
+                  >
+                    <Camera className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Dedicated Mobile & Desktop Barcode Scanner Button */}
+              <button
+                type="button"
+                id="btn-pharmacy-barcode-camera"
+                onClick={() => setIsBarcodeScannerOpen(true)}
+                className="px-3 py-2 bg-blue-50 hover:bg-blue-100 border border-blue-200 text-blue-700 rounded-lg text-xs font-bold transition flex items-center gap-1.5 shrink-0 cursor-pointer shadow-2xs active:scale-95"
+                title="مسح الباركود بكاميرا الموبايل"
+              >
+                <Camera className="w-4 h-4 text-blue-600" />
+                <span className="inline">مسح الباركود</span>
+              </button>
             </div>
 
             {/* Quick Actions & View Mode Toggle */}
@@ -851,6 +1265,42 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
           )}
         </div>
       </div>
+
+      {/* Cart Access Guard Notification */}
+      {(!currentUser || currentUser.status !== 'approved' || cartAccessWarning) && (
+        <div className="w-full max-w-full px-3 sm:px-6 mt-2.5">
+          <div className={`p-3 rounded-2xl flex flex-col sm:flex-row items-center justify-between gap-3 text-xs font-bold border shadow-xs ${
+            !currentUser
+              ? 'bg-blue-50/90 text-blue-900 border-blue-200'
+              : currentUser?.status === 'pending'
+              ? 'bg-amber-50/90 text-amber-900 border-amber-200'
+              : 'bg-rose-50/90 text-rose-900 border-rose-200'
+          }`}>
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 shrink-0 text-blue-600" />
+              <span>
+                {cartAccessWarning || (
+                  !currentUser
+                    ? 'أهلاً بك! يمكنك تصفح قائمة الأدوية والأسعار العامة، وتُقفل السلة مع رسالة: "يرجى تسجيل الدخول للطلب".'
+                    : currentUser?.status === 'pending'
+                    ? 'طلب تسجيل صيدليتك قيد المراجعة والاعتماد من قبل إدارة المذخر • سيتم تفعيل السلة فور الموافقة.'
+                    : 'تم إلغاء صلاحية الوصول إلى النظام'
+                )}
+              </span>
+            </div>
+            {!currentUser && onOpenAuth && (
+              <button
+                id="btn-portal-login-prompt"
+                type="button"
+                onClick={onOpenAuth}
+                className="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-black transition cursor-pointer shadow-xs whitespace-nowrap active:scale-95"
+              >
+                تسجيل الدخول / طلب صيدلية
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Medicines Presentation Area */}
       <div className="w-full max-w-full px-3 sm:px-6 mt-3">
@@ -1177,53 +1627,101 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
             </div>
 
             {/* Filter Pills */}
-            <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-xl text-xs font-bold border border-slate-200">
-              <button
-                type="button"
-                onClick={() => setOrderStatusFilter('all')}
-                className={`px-3 py-1.5 rounded-lg transition cursor-pointer ${
-                  orderStatusFilter === 'all'
-                    ? 'bg-white text-blue-700 shadow-2xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                الكل ({myOrders.length})
-              </button>
-              <button
-                type="button"
-                onClick={() => setOrderStatusFilter('pending')}
-                className={`px-3 py-1.5 rounded-lg transition cursor-pointer ${
-                  orderStatusFilter === 'pending'
-                    ? 'bg-white text-blue-700 shadow-2xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                قيد المراجعة ({myOrders.filter((o) => o.status === 'new' || o.status === 'pending').length})
-              </button>
-              <button
-                type="button"
-                onClick={() => setOrderStatusFilter('ready')}
-                className={`px-3 py-1.5 rounded-lg transition cursor-pointer ${
-                  orderStatusFilter === 'ready'
-                    ? 'bg-white text-blue-700 shadow-2xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                تم التجهيز ({myOrders.filter((o) => o.status === 'ready' || o.status === 'preparing').length})
-              </button>
-              <button
-                type="button"
-                onClick={() => setOrderStatusFilter('completed')}
-                className={`px-3 py-1.5 rounded-lg transition cursor-pointer ${
-                  orderStatusFilter === 'completed'
-                    ? 'bg-white text-blue-700 shadow-2xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                مكتمل ({myOrders.filter((o) => o.status === 'completed').length})
-              </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-xl text-xs font-bold border border-slate-200">
+                <button
+                  type="button"
+                  onClick={() => setOrderStatusFilter('all')}
+                  className={`px-3 py-1.5 rounded-lg transition cursor-pointer ${
+                    orderStatusFilter === 'all'
+                      ? 'bg-white text-blue-700 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  الكل ({myOrders.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setOrderStatusFilter('pending')}
+                  className={`px-3 py-1.5 rounded-lg transition cursor-pointer ${
+                    orderStatusFilter === 'pending'
+                      ? 'bg-white text-blue-700 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  قيد المراجعة ({myOrders.filter((o) => o.status === 'new' || (o.status as string) === 'pending').length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setOrderStatusFilter('ready')}
+                  className={`px-3 py-1.5 rounded-lg transition cursor-pointer ${
+                    orderStatusFilter === 'ready'
+                      ? 'bg-white text-blue-700 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  تم التجهيز ({myOrders.filter((o) => o.status === 'ready' || o.status === 'preparing').length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setOrderStatusFilter('completed')}
+                  className={`px-3 py-1.5 rounded-lg transition cursor-pointer ${
+                    orderStatusFilter === 'completed'
+                      ? 'bg-white text-blue-700 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  مكتمل ({myOrders.filter((o) => o.status === 'delivered' || (o.status as string) === 'completed').length})
+                </button>
+              </div>
+
+              {/* Quick bulk delete pending orders button if more than 1 pending */}
+              {pendingOrdersList.length > 1 && (orderStatusFilter === 'all' || orderStatusFilter === 'pending') && (
+                <button
+                  type="button"
+                  onClick={() => setShowDeleteAllPendingModal(true)}
+                  className="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer shadow-2xs shrink-0"
+                  title="حذف جميع الطلبات المعلقة دفعة واحدة"
+                >
+                  <Trash2 className="w-3.5 h-3.5 text-rose-600" />
+                  <span>حذف كافة الطلبات المعلقة ({pendingOrdersList.length})</span>
+                </button>
+              )}
             </div>
           </div>
+
+          {/* Pharmacy Branch Filter (for multi-pharmacy employees) */}
+          {pharmacyBranches.length > 1 && (
+            <div className="flex items-center gap-2 overflow-x-auto pb-1 text-xs">
+              <span className="text-slate-500 font-bold shrink-0">عرض طلبيات:</span>
+              <button
+                type="button"
+                onClick={() => setSelectedPharmacyFilter('all')}
+                className={`px-3 py-1 rounded-lg text-xs font-bold transition cursor-pointer shrink-0 ${
+                  selectedPharmacyFilter === 'all'
+                    ? 'bg-blue-600 text-white shadow-xs'
+                    : 'bg-white text-slate-700 hover:bg-slate-100 border border-slate-200'
+                }`}
+              >
+                كافة الصيدليات ({pharmacyBranches.length})
+              </button>
+              {pharmacyBranches.map((branch) => (
+                <button
+                  key={branch.id}
+                  type="button"
+                  onClick={() => setSelectedPharmacyFilter(branch.name)}
+                  className={`px-3 py-1 rounded-lg text-xs font-bold transition cursor-pointer shrink-0 flex items-center gap-1 ${
+                    selectedPharmacyFilter.toLowerCase() === branch.name.toLowerCase()
+                      ? 'bg-blue-600 text-white shadow-xs'
+                      : 'bg-white text-slate-700 hover:bg-slate-100 border border-slate-200'
+                  }`}
+                >
+                  <Building className="w-3 h-3" />
+                  <span>{branch.name}</span>
+                </button>
+              ))}
+            </div>
+          )}
 
           {/* Orders Cards List */}
           {myOrders.length === 0 ? (
@@ -1258,10 +1756,10 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
           ) : (
             <div className="space-y-4">
               {filteredOrdersHistory.map((order) => {
-                const isPending = order.status === 'new' || order.status === 'pending';
+                const isPending = order.status === 'new' || (order.status as string) === 'pending';
                 const isPreparing = order.status === 'preparing';
                 const isReady = order.status === 'ready';
-                const isCompleted = order.status === 'completed';
+                const isCompleted = order.status === 'delivered' || (order.status as string) === 'completed';
                 const isRejected = order.status === 'rejected';
 
                 return (
@@ -1332,6 +1830,18 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
                       </div>
 
                       <div className="flex items-center gap-2">
+                        {isPending && (
+                          <button
+                            type="button"
+                            id={`btn-delete-order-${order.id}`}
+                            onClick={() => setOrderToDelete(order)}
+                            className="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer border border-rose-200 shadow-2xs"
+                            title="إلغاء وحذف هذا الطلب المعلق نهائياً"
+                          >
+                            <Trash2 className="w-3.5 h-3.5 text-rose-600" />
+                            <span>حذف الطلب المعلق</span>
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={() => setSelectedOrderForPrint(order)}
@@ -1570,19 +2080,30 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
 
                   {/* Pending Order Merging Notice */}
                   {pendingOrderForPharmacy && (
-                    <div className="p-3 bg-amber-50 border border-amber-300 rounded-xl flex items-start gap-2.5 text-xs text-amber-950 animate-in fade-in duration-150">
-                      <Layers className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                      <div>
-                        <div className="font-black flex items-center gap-1.5">
-                          <span>دمج تلقائي مع طلبك قيد التدقيق:</span>
-                          <span className="font-mono bg-amber-200 text-amber-900 px-1.5 py-0.2 rounded font-black">
-                            #{pendingOrderForPharmacy.orderNumber}
-                          </span>
+                    <div className="p-3 bg-amber-50 border border-amber-300 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2.5 text-xs text-amber-950 animate-in fade-in duration-150">
+                      <div className="flex items-start gap-2.5">
+                        <Layers className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                        <div>
+                          <div className="font-black flex items-center gap-1.5">
+                            <span>دمج تلقائي مع طلبك قيد التدقيق:</span>
+                            <span className="font-mono bg-amber-200 text-amber-900 px-1.5 py-0.2 rounded font-black">
+                              #{pendingOrderForPharmacy.orderNumber}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-amber-800 mt-0.5 leading-relaxed">
+                            يوجد طلب حالي قيد المراجعة في المذخر. عند تأكيد هذا الطلب، ستُدمج هذه الأصناف تلقائياً في نفس الطلب لتصلكم في شحنة واحدة موحدة.
+                          </p>
                         </div>
-                        <p className="text-[11px] text-amber-800 mt-0.5 leading-relaxed">
-                          يوجد طلب حالي قيد المراجعة في المذخر. عند تأكيد هذا الطلب، ستُدمج هذه الأصناف تلقائياً في نفس الطلب لتصلكم في شحنة واحدة موحدة.
-                        </p>
                       </div>
+                      <button
+                        type="button"
+                        onClick={() => setOrderToDelete(pendingOrderForPharmacy)}
+                        className="px-2.5 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-lg text-[11px] font-bold transition cursor-pointer flex items-center gap-1 shrink-0"
+                        title="حذف هذا الطلب المعلق لبدء طلبية جديدة منفصلة"
+                      >
+                        <Trash2 className="w-3.5 h-3.5 text-rose-600" />
+                        <span>حذف الطلب المعلق</span>
+                      </button>
                     </div>
                   )}
 
@@ -1698,11 +2219,84 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
                   </div>
 
                   {/* Pharmacy Details Form */}
-                  <form onSubmit={handleCheckoutSubmit} id="pharmacy-checkout-form" className="space-y-3 pt-4 border-t border-slate-200">
-                    <h4 className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
-                      <Building className="w-4 h-4 text-blue-600" />
-                      بيانات الاستلام:
-                    </h4>
+                  <form onSubmit={handleCheckoutSubmit} id="pharmacy-checkout-form" className="space-y-3.5 pt-4 border-t border-slate-200">
+                    <div className="flex items-center justify-between">
+                      <h4 className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                        <Building className="w-4 h-4 text-blue-600" />
+                        <span>بيانات الصيدلية والاستلام:</span>
+                      </h4>
+                      <button
+                        type="button"
+                        onClick={() => setIsAddBranchModalOpen(true)}
+                        className="text-[11px] font-bold text-blue-700 hover:text-blue-900 flex items-center gap-1 bg-blue-50 hover:bg-blue-100 px-2 py-1 rounded-lg border border-blue-200 transition cursor-pointer"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        <span>إضافة صيدلية ثانية لنفس الرقم</span>
+                      </button>
+                    </div>
+
+                    {/* Quick Branch Selector at Checkout Time */}
+                    {pharmacyBranches.length > 0 && (
+                      <div className="bg-slate-50 border border-slate-200/90 rounded-xl p-2.5 space-y-2">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="font-bold text-slate-700">اختر الصيدلية المراد توجيه الطلب إليها:</span>
+                          <span className="text-slate-400 font-mono text-[10px]">
+                            {pharmacyBranches.length} صيدليات مرتبطة برقمك
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          {pharmacyBranches.map((b, idx) => {
+                            const isSelected = b.name.trim().toLowerCase() === pharmacyName.trim().toLowerCase();
+                            const branchLabel = idx === 0 ? 'الصيدلية الأولى' : idx === 1 ? 'الصيدلية الثانية' : `الفرع ${idx + 1}`;
+                            return (
+                              <button
+                                key={b.id}
+                                type="button"
+                                onClick={() => handleSelectPharmacyBranch(b)}
+                                className={`p-2.5 rounded-xl border text-right transition flex items-start justify-between gap-2 cursor-pointer ${
+                                  isSelected
+                                    ? 'bg-blue-600 text-white border-blue-600 shadow-xs ring-2 ring-blue-300'
+                                    : 'bg-white hover:bg-slate-100/80 text-slate-700 border-slate-200'
+                                }`}
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <div className="font-bold text-xs flex items-center gap-1.5 flex-wrap truncate">
+                                    <span
+                                      className={`text-[9px] px-1.5 py-0.2 rounded font-bold ${
+                                        isSelected
+                                          ? 'bg-white/20 text-white'
+                                          : 'bg-slate-100 text-slate-700'
+                                      }`}
+                                    >
+                                      {branchLabel}
+                                    </span>
+                                    <span className="truncate">{b.name}</span>
+                                    {isSelected && (
+                                      <span className="bg-white/20 text-white text-[9px] px-1.5 py-0.2 rounded font-mono font-medium">
+                                        محددة للطلب
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className={`text-[11px] truncate mt-0.5 ${isSelected ? 'text-blue-100' : 'text-slate-500'}`}>
+                                    📍 {b.address || 'بدون عنوان محدد'}
+                                  </div>
+                                  {b.pharmacistName && (
+                                    <div className={`text-[10px] truncate ${isSelected ? 'text-blue-200' : 'text-slate-400'}`}>
+                                      المسؤول: {b.pharmacistName}
+                                    </div>
+                                  )}
+                                </div>
+                                <div className={`w-4 h-4 rounded-full border flex items-center justify-center shrink-0 mt-0.5 ${
+                                  isSelected ? 'border-white bg-white text-blue-600' : 'border-slate-300'
+                                }`}>
+                                  {isSelected && <Check className="w-3 h-3 stroke-[3]" />}
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
 
                     <div>
                       <label className="block text-xs font-semibold text-slate-600 mb-1">
@@ -2146,15 +2740,15 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
                         <td className="p-2.5 font-medium text-slate-700">
                           {item.isBonusMelted && item.meltedUnitPrice ? (
                             <div>
-                              <span className="font-bold text-emerald-800">{item.meltedUnitPrice.toLocaleString()} {settings.currency}</span>
+                              <span className="font-bold text-emerald-800">{(item.meltedUnitPrice ?? item.unitPrice ?? 0).toLocaleString()} {settings.currency}</span>
                               <span className="block text-[9px] text-emerald-600 font-bold">تذويب {item.bonusPercentage}%</span>
                             </div>
                           ) : (
-                            <span>{item.unitPrice.toLocaleString()} {settings.currency}</span>
+                            <span>{(item.unitPrice ?? 0).toLocaleString()} {settings.currency}</span>
                           )}
                         </td>
                         <td className="p-2.5 font-bold text-slate-900">
-                          {item.status === 'unavailable' ? '0' : item.totalPrice.toLocaleString()} {settings.currency}
+                          {item.status === 'unavailable' ? '0' : (item.totalPrice ?? (item.quantity * item.unitPrice) ?? 0).toLocaleString()} {settings.currency}
                         </td>
                         <td className="p-2.5 text-center">
                           {item.status === 'unavailable' ? (
@@ -2193,7 +2787,7 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
                   <div className="border-t-2 border-slate-900 pt-2 flex justify-between text-base font-black text-slate-950">
                     <span>المبلغ الصافي المطلوب:</span>
                     <span className="text-blue-700">
-                      {selectedOrderForPrint.totalAmount.toLocaleString()} {settings.currency}
+                      {(selectedOrderForPrint?.totalAmount ?? 0).toLocaleString()} {settings.currency}
                     </span>
                   </div>
                 </div>
@@ -2297,6 +2891,183 @@ export const PharmacyPortal: React.FC<PharmacyPortalProps> = ({
             <ExternalLink className="w-3.5 h-3.5" />
           </button>
         </div>
+      )}
+
+      {/* Add Pharmacy Branch Modal (for employees with same phone managing multiple pharmacies) */}
+      <AddPharmacyBranchModal
+        isOpen={isAddBranchModalOpen}
+        onClose={() => setIsAddBranchModalOpen(false)}
+        userPhone={userPhone}
+        defaultPharmacistName={pharmacistName}
+        onAddBranch={handleAddNewBranch}
+      />
+
+      {/* Delete Single Pending Order Confirmation Modal */}
+      {orderToDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-md bg-white rounded-2xl p-6 shadow-2xl space-y-4 animate-in zoom-in-95 duration-200">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-10 h-10 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center border border-rose-200">
+                  <Trash2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900">تأكيد حذف الطلب المعلق</h3>
+                  <p className="text-xs text-slate-500 font-mono">
+                    رقم الطلب: {orderToDelete.orderNumber}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setOrderToDelete(null)}
+                className="text-slate-400 hover:text-slate-600 p-1.5 rounded-lg hover:bg-slate-100 transition cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              <div className="bg-slate-50 rounded-xl p-3 border border-slate-200 text-xs space-y-1.5">
+                <div className="flex justify-between text-slate-600">
+                  <span>الصيدلية:</span>
+                  <span className="font-bold text-slate-800">{orderToDelete.pharmacyName}</span>
+                </div>
+                <div className="flex justify-between text-slate-600">
+                  <span>عدد الأصناف:</span>
+                  <span className="font-bold text-slate-800">{orderToDelete.items.length} مواد</span>
+                </div>
+                <div className="flex justify-between text-slate-600">
+                  <span>المبلغ الإجمالي:</span>
+                  <span className="font-bold text-blue-700 font-mono">
+                    {((orderToDelete as any)?.totalAmount ?? (orderToDelete as any)?.totalPrice ?? 0).toLocaleString()} {orderToDelete.currency || 'د.ع'}
+                  </span>
+                </div>
+                <div className="flex justify-between text-slate-600">
+                  <span>تاريخ الإرسال:</span>
+                  <span className="text-slate-700">
+                    {orderToDelete.createdAt ? new Date(orderToDelete.createdAt).toLocaleString('ar-IQ') : '—'}
+                  </span>
+                </div>
+              </div>
+
+              <div className="bg-rose-50 border border-rose-200 rounded-xl p-3 text-xs text-rose-950 space-y-1">
+                <p className="font-bold flex items-center gap-1 text-rose-700">
+                  <AlertCircle className="w-4 h-4 shrink-0" /> تنبيه:
+                </p>
+                <p className="text-rose-800 leading-relaxed">
+                  سيتم إلغاء وحذف هذا الطلب المعلق نهائياً ولن يتم إرساله لمستودع التجهيز في المذخر.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setOrderToDelete(null)}
+                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition cursor-pointer"
+              >
+                تراجع
+              </button>
+              <button
+                type="button"
+                id="btn-confirm-delete-pending-order"
+                disabled={isDeletingOrder}
+                onClick={handleConfirmDeleteSingleOrder}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 active:bg-rose-800 text-white rounded-xl text-xs font-bold transition shadow-xs cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
+              >
+                <Trash2 className="w-4 h-4" />
+                <span>{isDeletingOrder ? 'جاري الحذف...' : 'نعم، حذف الطلب المعلق'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete All Pending Orders Confirmation Modal */}
+      {showDeleteAllPendingModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-md bg-white rounded-2xl p-6 shadow-2xl space-y-4 animate-in zoom-in-95 duration-200">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-10 h-10 rounded-xl bg-rose-100 text-rose-600 flex items-center justify-center border border-rose-200">
+                  <Trash2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900">تأكيد حذف كافة الطلبات المعلقة</h3>
+                  <p className="text-xs text-slate-500">
+                    {pendingOrdersList.length} طلبيات معلقة قيد المراجعة
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowDeleteAllPendingModal(false)}
+                className="text-slate-400 hover:text-slate-600 p-1.5 rounded-lg hover:bg-slate-100 transition cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="bg-rose-50 border border-rose-200 rounded-xl p-3.5 text-xs text-rose-950 space-y-2">
+              <p className="font-bold flex items-center gap-1 text-rose-700">
+                <AlertCircle className="w-4 h-4 shrink-0" /> تحذير: هذا الإجراء نهائي
+              </p>
+              <p className="text-rose-800 leading-relaxed">
+                هل أنت متأكد من رغبتك في حذف جميع الطلبات المعلقة ({pendingOrdersList.length} طلبية)؟
+                سيتم إلغاؤها وإزالتها بالكامل ولن تصل إلى مستودع المذخر.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setShowDeleteAllPendingModal(false)}
+                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-semibold transition cursor-pointer"
+              >
+                إلغاء
+              </button>
+              <button
+                type="button"
+                id="btn-confirm-delete-all-pending-pharmacy"
+                disabled={isDeletingOrder}
+                onClick={handleConfirmDeleteAllPendingOrders}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 active:bg-rose-800 text-white rounded-xl text-xs font-bold transition shadow-xs cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
+              >
+                <Trash2 className="w-4 h-4" />
+                <span>{isDeletingOrder ? 'جاري الحذف...' : 'نعم، حذف كل الطلبات المعلقة'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Floating Feedback Toast */}
+      {deleteOrderFeedback && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-slate-900 text-white px-5 py-3 rounded-2xl shadow-xl flex items-center gap-3 text-xs font-bold animate-in fade-in slide-in-from-bottom-3 duration-200">
+          <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+          <span>{deleteOrderFeedback}</span>
+          <button
+            type="button"
+            onClick={() => setDeleteOrderFeedback(null)}
+            className="text-slate-400 hover:text-white p-1 rounded-lg transition cursor-pointer"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* Camera Barcode Scanner Modal for Pharmacy & Customers */}
+      {isBarcodeScannerOpen && (
+        <CameraBarcodeScannerModal
+          isOpen={true}
+          onClose={() => setIsBarcodeScannerOpen(false)}
+          onDetected={(detectedBarcode) => {
+            setSearchTerm(detectedBarcode);
+            setIsBarcodeScannerOpen(false);
+          }}
+          title="مسح باركود الدواء في المذخر"
+        />
       )}
     </div>
   );

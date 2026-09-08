@@ -1,5 +1,4 @@
 import { Product } from '../types';
-import * as XLSX from 'xlsx';
 
 export interface ExpiryAlertItem {
   product: Product;
@@ -211,7 +210,8 @@ export function computeInventoryAlerts(products: Product[]): InventoryAlertSumma
 /**
  * Generates and downloads an Excel spreadsheet report of all stock-out and near-expiry alerts
  */
-export function exportAlertsReportToExcel(alerts: InventoryAlertSummary, warehouseName = 'مذخر سامو') {
+export async function exportAlertsReportToExcel(alerts: InventoryAlertSummary, warehouseName = 'مذخر سامو') {
+  const XLSX = await import('xlsx');
   const wb = XLSX.utils.book_new();
 
   // Sheet 1: Stock alerts (Out of stock & Low stock)

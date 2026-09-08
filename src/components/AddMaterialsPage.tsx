@@ -24,11 +24,11 @@ import {
   AlertTriangle,
   Camera
 } from 'lucide-react';
-import * as XLSX from 'xlsx';
 import { Product, WarehouseSettings, calculateMeltedPrice } from '../types';
 import { GLOBAL_DOSAGE_FORMS, getDosageFormLabel } from '../data/dosageForms';
-import { CameraBarcodeScannerModal } from './CameraBarcodeScannerModal';
 import { useHardwareBarcodeScanner } from '../hooks/useHardwareBarcodeScanner';
+
+const CameraBarcodeScannerModal = React.lazy(() => import('./CameraBarcodeScannerModal').then(m => ({ default: m.CameraBarcodeScannerModal })));
 
 interface AddMaterialsPageProps {
   products: Product[];
@@ -221,7 +221,7 @@ export const AddMaterialsPage: React.FC<AddMaterialsPageProps> = ({
   };
 
   // Download Sample Excel Template
-  const handleDownloadTemplate = () => {
+  const handleDownloadTemplate = async () => {
     const sampleData = [
       {
         'الاسم التجاري عربي': 'بنادول إكسترا أقراص',
@@ -261,6 +261,7 @@ export const AddMaterialsPage: React.FC<AddMaterialsPageProps> = ({
       },
     ];
 
+    const XLSX = await import('xlsx');
     const ws = XLSX.utils.json_to_sheet(sampleData);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'قالب استيراد الأدوية');
@@ -272,8 +273,9 @@ export const AddMaterialsPage: React.FC<AddMaterialsPageProps> = ({
     setImportError(null);
     const reader = new FileReader();
 
-    reader.onload = (e) => {
+    reader.onload = async (e) => {
       try {
+        const XLSX = await import('xlsx');
         const data = new Uint8Array(e.target?.result as ArrayBuffer);
         const workbook = XLSX.read(data, { type: 'array' });
         const firstSheetName = workbook.SheetNames[0];
@@ -688,7 +690,7 @@ export const AddMaterialsPage: React.FC<AddMaterialsPageProps> = ({
                   <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 flex items-center justify-between text-xs font-bold text-amber-900">
                     <span>السعر النهائي المذاب للصيدلية:</span>
                     <span className="text-sm font-black text-amber-700">
-                      {calculateMeltedPrice(wholesalePrice, bonusPercentage).toLocaleString()} د.ع
+                      {(calculateMeltedPrice(wholesalePrice || 0, bonusPercentage || 0) ?? 0).toLocaleString()} د.ع
                     </span>
                   </div>
                 )}
@@ -1020,7 +1022,7 @@ export const AddMaterialsPage: React.FC<AddMaterialsPageProps> = ({
                             {row.stockQuantity}
                           </td>
                           <td className="p-2.5 font-bold text-emerald-700">
-                            {row.wholesalePrice.toLocaleString()} د.ع
+                            {(row.wholesalePrice ?? 0).toLocaleString()} د.ع
                           </td>
                           <td className="p-2.5 text-slate-600">
                             {row.bonusPercentage > 0 ? `${row.bonusPercentage}%` : '-'}
@@ -1043,24 +1045,26 @@ export const AddMaterialsPage: React.FC<AddMaterialsPageProps> = ({
 
       {/* Camera Barcode Scanner Modal */}
       {isCameraOpen && (
-        <CameraBarcodeScannerModal
-          isOpen={true}
-          onClose={() => setIsCameraOpen(false)}
-          onDetected={(detected) => {
-            if (cameraTarget === 'primary') {
-              setBarcode(detected);
-              setFeedbackMsg({
-                type: 'success',
-                text: `تم مسح الباركود بنجاح: ${detected}`,
-              });
-              setTimeout(() => setFeedbackMsg(null), 3500);
-            } else {
-              setAliasInput(detected);
-            }
-            setIsCameraOpen(false);
-          }}
-          title={cameraTarget === 'primary' ? 'مسح الباركود الأساسي للمادة' : 'مسح الباركود البديل (Alias)'}
-        />
+        <React.Suspense fallback={null}>
+          <CameraBarcodeScannerModal
+            isOpen={true}
+            onClose={() => setIsCameraOpen(false)}
+            onDetected={(detected) => {
+              if (cameraTarget === 'primary') {
+                setBarcode(detected);
+                setFeedbackMsg({
+                  type: 'success',
+                  text: `تم مسح الباركود بنجاح: ${detected}`,
+                });
+                setTimeout(() => setFeedbackMsg(null), 3500);
+              } else {
+                setAliasInput(detected);
+              }
+              setIsCameraOpen(false);
+            }}
+            title={cameraTarget === 'primary' ? 'مسح الباركود الأساسي للمادة' : 'مسح الباركود البديل (Alias)'}
+          />
+        </React.Suspense>
       )}
     </div>
   );

@@ -6,6 +6,7 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
+    base: '/',
     plugins: [
       react(),
       tailwindcss(),
@@ -44,6 +45,7 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
+          maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
           runtimeCaching: [
             {
@@ -77,18 +79,22 @@ export default defineConfig(() => {
           ],
         },
         devOptions: {
-          enabled: true,
-          type: 'module',
+          enabled: false,
         },
       }),
     ],
     build: {
+      outDir: 'dist',
+      emptyOutDir: true,
+      chunkSizeWarningLimit: 2500,
       rollupOptions: {
         output: {
           manualChunks: {
+            vendor_firebase: ['firebase/app', 'firebase/firestore'],
             vendor_xlsx: ['xlsx'],
             vendor_zxing: ['@zxing/browser', '@zxing/library'],
             vendor_react: ['react', 'react-dom'],
+            vendor_icons: ['lucide-react'],
           },
         },
       },

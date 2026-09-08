@@ -32,9 +32,11 @@ import {
   History,
   Camera,
   ArrowUp,
-  ArrowDown
+  ArrowDown,
+  Printer,
+  CheckSquare,
+  Square
 } from 'lucide-react';
-import * as XLSX from 'xlsx';
 import { Product, WarehouseSettings, calculateMeltedPrice, AppUser } from '../types';
 import { GLOBAL_DOSAGE_FORMS, getDosageFormLabel } from '../data/dosageForms';
 import { 
@@ -43,11 +45,34 @@ import {
   calculateStockDetails, 
   exportAlertsReportToExcel 
 } from '../services/alertService';
-import { InventoryAdjustmentModal } from './InventoryAdjustmentModal';
-import { ProductAuditModal } from './ProductAuditModal';
-import { CameraBarcodeScannerModal } from './CameraBarcodeScannerModal';
 import { useHardwareBarcodeScanner } from '../hooks/useHardwareBarcodeScanner';
 import { analyzeFEFOStatus } from '../services/batchService';
+import { generateUniqueBarcode, renderBarcodeToSvg } from '../services/barcodeService';
+import { BarcodePrintModal, BarcodePrintItem } from './BarcodePrintModal';
+import { QuickBarcodeModal } from './QuickBarcodeModal';
+import { QuickQuantityModal } from './QuickQuantityModal';
+
+// Subcomponent for real-time SVG barcode rendering in Add/Edit modal
+const ModalBarcodeSvgPreview: React.FC<{ barcode: string }> = ({ barcode }) => {
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  useEffect(() => {
+    if (svgRef.current && barcode) {
+      renderBarcodeToSvg(svgRef.current, barcode, {
+        height: 32,
+        width: 1.3,
+        fontSize: 10,
+        margin: 2,
+      });
+    }
+  }, [barcode]);
+
+  if (!barcode) return <span className="text-[11px] text-slate-400">لا يوجد باركود حالياً</span>;
+  return <svg ref={svgRef} className="max-w-full h-8" />;
+};
+
+const InventoryAdjustmentModal = React.lazy(() => import('./InventoryAdjustmentModal').then(m => ({ default: m.InventoryAdjustmentModal })));
+const ProductAuditModal = React.lazy(() => import('./ProductAuditModal').then(m => ({ default: m.ProductAuditModal })));
+const CameraBarcodeScannerModal = React.lazy(() => import('./CameraBarcodeScannerModal').then(m => ({ default: m.CameraBarcodeScannerModal })));
 
 export type InventoryFilterType = 'all' | 'out_of_stock' | 'low_stock' | 'near_expiry' | 'expired';
 
@@ -85,14 +110,44 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
   const [lastScannedBarcode, setLastScannedBarcode] = useState<string | null>(null);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
 
+  // Quick Barcode Modal & Quick Quantity Modal & Barcode Printing Modal states
+  const [barcodeEditingProduct, setBarcodeEditingProduct] = useState<Product | null>(null);
+  const [quantityEditingProduct, setQuantityEditingProduct] = useState<Product | null>(null);
+  const [isPrintModalOpen, setIsPrintModalOpen] = useState<boolean>(false);
+  const [productsToPrint, setProductsToPrint] = useState<BarcodePrintItem[]>([]);
+  const [selectedProductIds, setSelectedProductIds] = useState<Set<string>>(new Set());
+  const [scanSuccessBanner, setScanSuccessBanner] = useState<{ barcode: string; product: Product } | null>(null);
+
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
   // High-Speed Barcode Hardware Scanner Hook (HID USB/Bluetooth)
   useHardwareBarcodeScanner({
     onScan: (scannedCode) => {
       setSearchTerm(scannedCode);
       setLastScannedBarcode(scannedCode);
+      const match = products.find(
+        (p) => (p.barcode && p.barcode.toLowerCase() === scannedCode.toLowerCase()) ||
+               (p.barcodeAliases && p.barcodeAliases.some(b => b.toLowerCase() === scannedCode.toLowerCase()))
+      );
+      if (match) {
+        setScanSuccessBanner({ barcode: scannedCode, product: match });
+        setTimeout(() => setScanSuccessBanner(null), 6000);
+      }
     },
-    enabled: !isModalOpen && !isImportModalOpen && !adjustingProduct && !auditingProduct && !isScannerOpen,
+    enabled: !isModalOpen && !isImportModalOpen && !adjustingProduct && !auditingProduct && !isScannerOpen && !isPrintModalOpen && !barcodeEditingProduct && !quantityEditingProduct,
   });
+
+  // Shortcut key F2 to focus the barcode search input
+  useEffect(() => {
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'F2') {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    };
+    window.addEventListener('keydown', handleGlobalKeyDown);
+    return () => window.removeEventListener('keydown', handleGlobalKeyDown);
+  }, []);
 
   // Sync initialFilter when changed externally (from notifications or dashboard)
   useEffect(() => {
@@ -229,7 +284,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
   const handleOpenAddModal = () => {
     setEditingProduct(null);
     setFormData({
-      barcode: `${Math.floor(1000000000000 + Math.random() * 9000000000000)}`,
+      barcode: generateUniqueBarcode(products),
       tradeNameAr: '',
       tradeNameEn: '',
       scientificName: '',
@@ -258,7 +313,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
     setEditingProduct(product);
     const bPercent = product.bonusPercentage || 0;
     setFormData({
-      barcode: product.barcode,
+      barcode: product.barcode || '',
       tradeNameAr: product.tradeNameAr,
       tradeNameEn: product.tradeNameEn,
       scientificName: product.scientificName,
@@ -301,6 +356,113 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
       });
     }
     setIsModalOpen(false);
+  };
+
+  // Exact barcode match detection for instant scanner feedback
+  const exactBarcodeMatch = useMemo(() => {
+    const term = searchTerm.trim().toLowerCase();
+    if (!term || term.length < 3) return null;
+    return products.find(
+      (p) => (p.barcode && p.barcode.toLowerCase() === term) ||
+             (p.barcodeAliases && p.barcodeAliases.some(b => b.toLowerCase() === term))
+    );
+  }, [products, searchTerm]);
+
+  // Fast direct quantity increment / decrement
+  const handleQuickDeltaQuantity = (product: Product, delta: number) => {
+    const newQty = Math.max(0, product.stockQuantity + delta);
+    onUpdateProduct({
+      ...product,
+      stockQuantity: newQty,
+      isAvailable: newQty > 0,
+    });
+  };
+
+  // Save new quantity from QuickQuantityModal
+  const handleSaveQuantity = (productId: string, newQuantity: number) => {
+    const target = products.find((p) => p.id === productId);
+    if (target) {
+      onUpdateProduct({
+        ...target,
+        stockQuantity: Math.max(0, newQuantity),
+        isAvailable: newQuantity > 0,
+      });
+    }
+  };
+
+  // Save new barcode from QuickBarcodeModal
+  const handleSaveBarcode = (productId: string, newBarcode: string) => {
+    const target = products.find((p) => p.id === productId);
+    if (target) {
+      onUpdateProduct({
+        ...target,
+        barcode: newBarcode.trim(),
+      });
+    }
+  };
+
+  // Generate unique barcode directly in 1-click for products lacking barcode
+  const handleGenerateBarcodeDirectly = (product: Product) => {
+    const newBarcode = generateUniqueBarcode(products);
+    onUpdateProduct({
+      ...product,
+      barcode: newBarcode,
+    });
+  };
+
+  // Open single product barcode print modal
+  const handleOpenSinglePrint = (product: Product) => {
+    setProductsToPrint([{ product, copies: 1 }]);
+    setIsPrintModalOpen(true);
+  };
+
+  // Open batch barcode print modal for selected or all filtered products
+  const handleBatchPrintSelectedOrFiltered = () => {
+    let itemsToPrint: Product[] = [];
+    if (selectedProductIds.size > 0) {
+      itemsToPrint = products.filter((p) => selectedProductIds.has(p.id));
+    } else {
+      itemsToPrint = filteredProducts;
+    }
+
+    if (itemsToPrint.length === 0) return;
+
+    setProductsToPrint(
+      itemsToPrint.map((product) => ({
+        product,
+        copies: 1,
+      }))
+    );
+    setIsPrintModalOpen(true);
+  };
+
+  // Toggle selection for individual product
+  const handleToggleSelectProduct = (productId: string) => {
+    setSelectedProductIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(productId)) {
+        next.delete(productId);
+      } else {
+        next.add(productId);
+      }
+      return next;
+    });
+  };
+
+  // Toggle selection for all visible products
+  const handleToggleSelectAllVisible = () => {
+    const visibleIds = visibleProducts.map((p) => p.id);
+    const allSelected = visibleIds.every((id) => selectedProductIds.has(id));
+
+    setSelectedProductIds((prev) => {
+      const next = new Set(prev);
+      if (allSelected) {
+        visibleIds.forEach((id) => next.delete(id));
+      } else {
+        visibleIds.forEach((id) => next.add(id));
+      }
+      return next;
+    });
   };
 
   const handleExportCSV = () => {
@@ -351,7 +513,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
   };
 
   // Download Sample Excel Template for Warehouse Medicines
-  const handleDownloadExcelTemplate = () => {
+  const handleDownloadExcelTemplate = async () => {
     const headers = [
       'الباركود',
       'اسم الدواء التجاري (عربي)',
@@ -420,6 +582,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
       ],
     ];
 
+    const XLSX = await import('xlsx');
     const ws = XLSX.utils.aoa_to_sheet([headers, ...sampleRows]);
     ws['!cols'] = [
       { wch: 16 },
@@ -449,8 +612,9 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
     setImportFileName(file.name);
 
     const reader = new FileReader();
-    reader.onload = (e) => {
+    reader.onload = async (e) => {
       try {
+        const XLSX = await import('xlsx');
         const data = new Uint8Array(e.target?.result as ArrayBuffer);
         const workbook = XLSX.read(data, { type: 'array' });
         const firstSheetName = workbook.SheetNames[0];
@@ -697,42 +861,135 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
           </div>
         )}
 
-        {/* Filters and search bar */}
-        <div className="bg-white p-4 rounded-xl border border-slate-200 mb-6 space-y-3 shadow-xs">
-          <div className="flex flex-col xl:flex-row items-stretch xl:items-center justify-between gap-3">
+        {/* Filters and search bar - High Visibility & Barcode Scanning Hub */}
+        <div className="bg-white p-4 sm:p-5 rounded-2xl border-2 border-slate-200 mb-6 space-y-3.5 shadow-sm">
+          {/* Top Row: Search Input with Scanner & Print Buttons */}
+          <div className="flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-3">
             <div className="flex items-center gap-2 flex-1">
-              <div className="relative flex-1">
-                <Search className="w-4 h-4 absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
+              <div className="relative flex-1 group">
+                <Search className="w-5 h-5 absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-blue-600 transition" />
                 <input
+                  ref={searchInputRef}
                   type="text"
-                  placeholder="ابحث بالاسم التجاري، العلمي، الباركود، رقم الوجبة، الشركة..."
+                  placeholder="ابحث بالاسم التجاري، العلمي، امسح الباركود مباشرة، رقم الوجبة، الشركة..."
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
-                  className="w-full pl-8 pr-10 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs sm:text-sm focus:outline-hidden focus:border-blue-500 transition"
+                  className="w-full pl-9 pr-11 py-2.5 bg-slate-50 hover:bg-slate-100/70 border-2 border-slate-200 rounded-xl text-xs sm:text-sm font-semibold text-slate-900 focus:outline-hidden focus:border-blue-600 focus:bg-white focus:ring-4 focus:ring-blue-100 transition shadow-2xs"
                 />
-                {searchTerm && (
+                <div className="absolute left-2.5 top-1/2 -translate-y-1/2 flex items-center gap-1">
+                  {searchTerm && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSearchTerm('');
+                        searchInputRef.current?.focus();
+                      }}
+                      className="text-slate-400 hover:text-rose-600 hover:bg-rose-50 p-1 rounded-md transition cursor-pointer"
+                      title="مسح البحث وإعادة التعيين"
+                    >
+                      ✕
+                    </button>
+                  )}
                   <button
                     type="button"
-                    onClick={() => setSearchTerm('')}
-                    className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-1"
-                    title="مسح البحث"
+                    onClick={() => setIsScannerOpen(true)}
+                    className="p-1 text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded-md transition cursor-pointer"
+                    title="مسح الباركود بكاميرا الموبايل"
                   >
-                    ✕
+                    <Camera className="w-4 h-4" />
                   </button>
-                )}
+                </div>
               </div>
+
+              {/* Quick Focus Button with Keyboard Shortcut */}
+              <button
+                type="button"
+                onClick={() => searchInputRef.current?.focus()}
+                className="px-3 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 rounded-xl text-xs font-bold transition flex items-center gap-1.5 shrink-0 cursor-pointer shadow-2xs"
+                title="تركيز مؤشر القارئ في حقل البحث (F2)"
+              >
+                <Barcode className="w-4 h-4 text-slate-700" />
+                <span className="hidden sm:inline">تركيز القارئ (F2)</span>
+              </button>
 
               {/* Barcode Camera Scanner */}
               <button
                 type="button"
+                id="btn-inventory-barcode-camera"
                 onClick={() => setIsScannerOpen(true)}
-                className="px-3 py-2 bg-blue-50 hover:bg-blue-100 border border-blue-200 text-blue-700 rounded-lg text-xs font-bold transition flex items-center gap-1.5 shrink-0 cursor-pointer shadow-2xs"
-                title="مسح الباركود بالكاميرا"
+                className="px-3.5 py-2.5 bg-blue-50 hover:bg-blue-100 border border-blue-200 text-blue-700 rounded-xl text-xs font-bold transition flex items-center gap-1.5 shrink-0 cursor-pointer shadow-2xs active:scale-95"
+                title="مسح الباركود عبر كاميرا الجهاز"
               >
                 <Camera className="w-4 h-4 text-blue-600" />
-                <span className="hidden sm:inline">مسح بالكاميرا</span>
+                <span className="inline">مسح بالكاميرا</span>
               </button>
             </div>
+
+            {/* Hardware Scanner Live Indicator & Batch Barcode Print Button */}
+            <div className="flex items-center gap-2 justify-between lg:justify-end flex-wrap">
+              {/* Ready status badge */}
+              <div className="flex items-center gap-1.5 px-3 py-2 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-xl text-xs font-bold select-none">
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                <span>قارئ الباركود جاهز للمسح (USB / Bluetooth)</span>
+              </div>
+
+              {/* Batch Print Barcode Labels Button */}
+              <button
+                type="button"
+                onClick={handleBatchPrintSelectedOrFiltered}
+                className="px-3.5 py-2 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-700 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
+                title="طباعة ملصقات الباركود على طابعة الملصقات المعرفة بالجهاز"
+              >
+                <Printer className="w-4 h-4 text-indigo-600" />
+                <span>
+                  طباعة ملصقات الباركود ({selectedProductIds.size > 0 ? selectedProductIds.size : filteredProducts.length})
+                </span>
+              </button>
+            </div>
+          </div>
+
+          {/* Scanned / Matched Product Instant Banner */}
+          {(exactBarcodeMatch || scanSuccessBanner) && (
+            <div className="p-3 bg-emerald-50 border-2 border-emerald-300 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs text-emerald-950 animate-in fade-in">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-emerald-600 text-white flex items-center justify-center shrink-0">
+                  <CheckCircle2 className="w-4 h-4" />
+                </div>
+                <div>
+                  <span className="font-bold text-sm block">
+                    تم العثور على: {(exactBarcodeMatch || scanSuccessBanner?.product)?.tradeNameAr}
+                  </span>
+                  <span className="text-[11px] text-emerald-700 font-mono">
+                    الباركود: {(exactBarcodeMatch || scanSuccessBanner?.product)?.barcode || '—'} • الرصيد الحالي: {(exactBarcodeMatch || scanSuccessBanner?.product)?.stockQuantity ?? 0} علبة • السعر: {((exactBarcodeMatch || scanSuccessBanner?.product)?.wholesalePrice ?? 0).toLocaleString()} {settings.currency}
+                  </span>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+                <button
+                  type="button"
+                  onClick={() => setQuantityEditingProduct(exactBarcodeMatch || scanSuccessBanner?.product || null)}
+                  className="px-3 py-1.5 bg-white hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-lg font-bold transition cursor-pointer"
+                >
+                  تعديل الكمية
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setBarcodeEditingProduct(exactBarcodeMatch || scanSuccessBanner?.product || null)}
+                  className="px-3 py-1.5 bg-white hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-lg font-bold transition cursor-pointer"
+                >
+                  تعديل الباركود
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleOpenSinglePrint(exactBarcodeMatch || scanSuccessBanner!.product)}
+                  className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg font-bold transition flex items-center gap-1 cursor-pointer"
+                >
+                  <Printer className="w-3.5 h-3.5" />
+                  <span>طباعة ملصق</span>
+                </button>
+              </div>
+            </div>
+          )}
 
             {/* Quick status tabs */}
             <div className="flex flex-wrap items-center gap-1.5 text-xs font-bold">
@@ -807,7 +1064,6 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                 </span>
               </button>
             </div>
-          </div>
 
           {/* Categories and Manufacturer filter row */}
           <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3 pt-2 border-t border-slate-100">
@@ -952,22 +1208,99 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                       </span>
                     </div>
 
-                    {/* Stock badge */}
+                    {/* Stock badge & Quick Steppers */}
                     <div className="text-left shrink-0">
                       {isZero ? (
-                        <span className="px-2.5 py-1 rounded-lg bg-rose-100 text-rose-800 border border-rose-200 text-xs font-black">
-                          نفد بالكامل
-                        </span>
+                        <div className="space-y-1">
+                          <span className="px-2.5 py-1 rounded-lg bg-rose-100 text-rose-800 border border-rose-200 text-xs font-black block">
+                            نفد بالكامل
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setQuantityEditingProduct(p)}
+                            className="text-[10px] text-blue-600 hover:underline font-bold"
+                          >
+                            إضافة رصيد
+                          </button>
+                        </div>
                       ) : (
                         <div className="text-left">
-                          <span className="font-bold text-sm text-slate-900 font-mono" dir="ltr">{p.stockQuantity}</span>
-                          <span className="text-[10px] text-slate-500 mr-1">علبة</span>
+                          <div className="flex items-center justify-end gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => handleQuickDeltaQuantity(p, -1)}
+                              className="w-6 h-6 rounded-lg bg-slate-100 hover:bg-rose-100 text-slate-700 hover:text-rose-700 font-bold text-xs flex items-center justify-center border border-slate-200 active:scale-90"
+                              title="خصم علبة (-1)"
+                            >
+                              -
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setQuantityEditingProduct(p)}
+                              className="px-2 py-0.5 rounded-lg bg-slate-50 hover:bg-amber-50 border border-slate-200 text-slate-900 font-mono font-black text-sm"
+                              title="اضغط لتعديل الكمية"
+                            >
+                              {p.stockQuantity} <span className="text-[10px] font-normal text-slate-500">علبة</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleQuickDeltaQuantity(p, 1)}
+                              className="w-6 h-6 rounded-lg bg-slate-100 hover:bg-emerald-100 text-slate-700 hover:text-emerald-700 font-bold text-xs flex items-center justify-center border border-slate-200 active:scale-90"
+                              title="إضافة علبة (+1)"
+                            >
+                              +
+                            </button>
+                          </div>
                           {isLow && (
-                            <span className="block text-[10px] text-orange-600 font-bold">
+                            <span className="block text-[10px] text-orange-600 font-bold mt-0.5">
                               مخزون حرج (حد {p.minStockLevel || 10})
                             </span>
                           )}
                         </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Barcode Strip on Mobile */}
+                  <div className="flex items-center justify-between gap-2 bg-slate-50 px-3 py-2 rounded-xl border border-slate-200 text-xs">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <Barcode className="w-4 h-4 text-slate-600 shrink-0" />
+                      {p.barcode ? (
+                        <span className="font-mono font-bold text-slate-800 truncate" dir="ltr">
+                          {p.barcode}
+                        </span>
+                      ) : (
+                        <span className="text-slate-400 text-[11px]">بدون باركود</span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      {p.barcode ? (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => setBarcodeEditingProduct(p)}
+                            className="px-2 py-1 bg-white hover:bg-slate-100 border border-slate-200 text-slate-700 rounded-lg text-[11px] font-bold transition"
+                          >
+                            تعديل
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleOpenSinglePrint(p)}
+                            className="px-2 py-1 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-700 rounded-lg text-[11px] font-bold transition flex items-center gap-1"
+                          >
+                            <Printer className="w-3 h-3 text-indigo-600" />
+                            <span>طباعة</span>
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => handleGenerateBarcodeDirectly(p)}
+                          className="px-2.5 py-1 bg-amber-100 hover:bg-amber-200 text-amber-900 rounded-lg text-[11px] font-bold transition flex items-center gap-1"
+                        >
+                          <Sparkles className="w-3 h-3 text-amber-700" />
+                          <span>توليد باركود</span>
+                        </button>
                       )}
                     </div>
                   </div>
@@ -989,14 +1322,14 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                     <div>
                       <span className="text-slate-400 block text-[10px]">السعر الأساسي:</span>
                       <span dir="ltr" className="font-bold text-slate-900 block">
-                        {p.wholesalePrice.toLocaleString()} {settings.currency}
+                        {(p.wholesalePrice ?? 0).toLocaleString()} {settings.currency}
                       </span>
                     </div>
                     <div>
                       <span className="text-slate-400 block text-[10px]">تذويب البونص:</span>
                       {p.bonusPercentage && p.bonusPercentage > 0 ? (
                         <span dir="ltr" className="font-bold text-emerald-700 block truncate">
-                          {calculateMeltedPrice(p.wholesalePrice, p.bonusPercentage).toLocaleString()} {settings.currency} ({p.bonusPercentage}%)
+                          {(calculateMeltedPrice(p.wholesalePrice, p.bonusPercentage) ?? 0).toLocaleString()} {settings.currency} ({p.bonusPercentage}%)
                         </span>
                       ) : (
                         <span className="text-slate-400 block font-mono">بدون تذويب</span>
@@ -1009,8 +1342,18 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                     <div className="flex items-center gap-1.5 flex-1">
                       <button
                         type="button"
+                        onClick={() => handleOpenSinglePrint(p)}
+                        className="py-2 px-2.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-800 text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer"
+                        title="طباعة ملصق الباركود على الطابعة المعرفة"
+                      >
+                        <Printer className="w-3.5 h-3.5 text-indigo-700" />
+                        <span>طباعة باركود</span>
+                      </button>
+
+                      <button
+                        type="button"
                         onClick={() => setAdjustingProduct(p)}
-                        className="flex-1 py-2 px-2.5 rounded-xl bg-amber-50 hover:bg-amber-100 border border-amber-200 text-amber-900 text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer"
+                        className="py-2 px-2 rounded-xl bg-amber-50 hover:bg-amber-100 border border-amber-200 text-amber-900 text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer"
                         title="تسوية جردية دقيقة"
                       >
                         <Scale className="w-3.5 h-3.5 text-amber-700" />
@@ -1020,11 +1363,11 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                       <button
                         type="button"
                         onClick={() => setAuditingProduct(p)}
-                        className="flex-1 py-2 px-2.5 rounded-xl bg-purple-50 hover:bg-purple-100 border border-purple-200 text-purple-900 text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer"
+                        className="py-2 px-2 rounded-xl bg-purple-50 hover:bg-purple-100 border border-purple-200 text-purple-900 text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer"
                         title="سجل التدقيق والحركات"
                       >
                         <History className="w-3.5 h-3.5 text-purple-700" />
-                        <span>سجل التدقيق</span>
+                        <span>تدقيق</span>
                       </button>
                     </div>
 
@@ -1075,25 +1418,35 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
             ref={desktopListRef}
             className="hidden md:block overflow-auto max-h-[62vh] xl:max-h-[68vh] min-h-[420px] scroll-smooth overscroll-contain bg-white"
           >
-            <table className="w-full text-xs text-right min-w-[1050px]">
+            <table className="w-full text-xs text-right min-w-[1200px]">
               <thead className="sticky top-0 z-10 shadow-xs">
-                <tr className="bg-slate-900 text-slate-200 font-semibold border-b border-slate-700">
+                <tr className="bg-slate-900 text-slate-200 font-semibold border-b border-slate-700 select-none">
+                  <th className="p-3 w-10 text-center">
+                    <input
+                      type="checkbox"
+                      checked={visibleProducts.length > 0 && visibleProducts.every((p) => selectedProductIds.has(p.id))}
+                      onChange={handleToggleSelectAllVisible}
+                      className="w-4 h-4 rounded text-blue-600 focus:ring-blue-500 cursor-pointer"
+                      title="تحديد كافة المواد الظاهرة للطباعة الدفعية"
+                    />
+                  </th>
                   <th className="p-3">اسم الدواء والمواصفات</th>
                   <th className="p-3">التركيبة العلمية</th>
                   <th className="p-3">الشركة والمنشأ</th>
+                  <th className="p-3 text-center min-w-[160px]">الباركود (Barcode)</th>
                   <th className="p-3 text-center">رقم الوجبة (Batch)</th>
                   <th className="p-3 text-center">تاريخ الصلاحية</th>
-                  <th className="p-3 text-center">الرصيد بالمخزن</th>
+                  <th className="p-3 text-center min-w-[130px]">الرصيد وتعديل الكمية</th>
                   <th className="p-3">سعر المفرد</th>
                   <th className="p-3">تذويب البونص</th>
                   <th className="p-3">ملاحظة البونص</th>
-                  <th className="p-3 text-center min-w-[140px]">إجراءات</th>
+                  <th className="p-3 text-center min-w-[170px]">إجراءات</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200">
                 {filteredProducts.length === 0 ? (
                   <tr>
-                    <td colSpan={10} className="p-12 text-center text-slate-400">
+                    <td colSpan={12} className="p-12 text-center text-slate-400">
                       <PackageX className="w-10 h-10 mx-auto text-slate-300 mb-2" />
                       <p className="font-bold text-sm text-slate-700">لا توجد أدوية مطابقة للبحث أو الفلتر المحدد</p>
                       <p className="text-xs text-slate-400 mt-1">يرجى تعديل مصطلح البحث أو اختيار "الكل"</p>
@@ -1110,7 +1463,9 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                     <tr 
                       key={p.id} 
                       className={`transition ${
-                        isZero 
+                        selectedProductIds.has(p.id)
+                          ? 'bg-blue-50/70'
+                          : isZero 
                           ? 'bg-rose-50/40 hover:bg-rose-50/70' 
                           : expInfo.status === 'expired'
                           ? 'bg-red-50/40 hover:bg-red-50/70'
@@ -1119,6 +1474,16 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                           : 'hover:bg-slate-50/80'
                       }`}
                     >
+                      {/* Checkbox for batch printing */}
+                      <td className="p-3 text-center">
+                        <input
+                          type="checkbox"
+                          checked={selectedProductIds.has(p.id)}
+                          onChange={() => handleToggleSelectProduct(p.id)}
+                          className="w-4 h-4 rounded text-blue-600 focus:ring-blue-500 cursor-pointer"
+                        />
+                      </td>
+
                       <td className="p-3">
                         <span className="font-bold text-slate-900 block text-[13px]">
                           {p.tradeNameAr}
@@ -1137,6 +1502,47 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
 
                       <td className="p-3 text-slate-700 font-medium">
                         {p.manufacturer}
+                      </td>
+
+                      {/* Barcode column with quick generate / edit / print */}
+                      <td className="p-3 text-center">
+                        {p.barcode ? (
+                          <div className="flex items-center justify-center gap-1">
+                            <span 
+                              className="font-mono text-[11px] font-bold text-slate-800 bg-slate-100 hover:bg-slate-200 px-2 py-0.5 rounded border border-slate-200 select-all cursor-copy" 
+                              dir="ltr"
+                              title="اضغط لتحديد الباركود ونسخه"
+                            >
+                              {p.barcode}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => setBarcodeEditingProduct(p)}
+                              className="p-1 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded transition cursor-pointer"
+                              title="تعديل أو إعادة توليد الباركود"
+                            >
+                              <Edit3 className="w-3 h-3" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleOpenSinglePrint(p)}
+                              className="p-1 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded transition cursor-pointer"
+                              title="طباعة ملصق الباركود على الطابعة المعرفة بالجهاز"
+                            >
+                              <Printer className="w-3 h-3 text-indigo-600" />
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => handleGenerateBarcodeDirectly(p)}
+                            className="px-2 py-1 bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 rounded-lg font-bold text-[10px] transition inline-flex items-center gap-1 cursor-pointer shadow-2xs"
+                            title="توليد رمز باركود تلقائي وحفظه فوراً"
+                          >
+                            <Sparkles className="w-3 h-3 text-amber-600" />
+                            <span>توليد باركود</span>
+                          </button>
+                        )}
                       </td>
 
                       <td className="p-3 text-center font-mono font-bold text-slate-800">
@@ -1165,31 +1571,81 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                         )}
                       </td>
 
+                      {/* Stock Quantity with Quick Editing & Steppers */}
                       <td className="p-3 text-center">
                         <div className="inline-flex flex-col items-center">
                           {isZero ? (
-                            <span className="px-2.5 py-1 rounded-md bg-rose-100 text-rose-800 border border-rose-300 font-black text-[11px]">
-                              نفد بالكامل (0 علبة)
-                            </span>
+                            <div className="space-y-1">
+                              <span className="px-2.5 py-0.5 rounded-md bg-rose-100 text-rose-800 border border-rose-300 font-black text-[11px] block">
+                                نفد بالكامل (0)
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => setQuantityEditingProduct(p)}
+                                className="text-[10px] text-blue-600 hover:underline font-bold cursor-pointer"
+                              >
+                                إضافة رصيد
+                              </button>
+                            </div>
                           ) : isLow ? (
                             <>
-                              <span className="font-bold text-sm text-orange-600" dir="ltr">
-                                {p.stockQuantity} علبة
-                              </span>
-                              <span className="text-[10px] text-orange-700 font-bold bg-orange-100 px-1.5 py-0.2 rounded mt-0.5 border border-orange-200">
+                              <div className="flex items-center gap-1">
+                                <span className="font-bold text-sm text-orange-600 font-mono" dir="ltr">
+                                  {p.stockQuantity} علبة
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => setQuantityEditingProduct(p)}
+                                  className="p-1 text-orange-600 hover:bg-orange-100 rounded transition cursor-pointer"
+                                  title="تعديل مباشر للكمية"
+                                >
+                                  <Edit3 className="w-3 h-3" />
+                                </button>
+                              </div>
+                              <span className="text-[9px] text-orange-700 font-bold bg-orange-100 px-1.5 py-0.2 rounded mt-0.5 border border-orange-200">
                                 مخزون حرج (حد: {p.minStockLevel || 10})
                               </span>
                             </>
                           ) : (
-                            <span className="font-bold text-sm text-slate-800" dir="ltr">
-                              {p.stockQuantity} علبة
-                            </span>
+                            <div className="flex items-center gap-1">
+                              <span className="font-bold text-sm text-slate-800 font-mono" dir="ltr">
+                                {p.stockQuantity} علبة
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => setQuantityEditingProduct(p)}
+                                className="p-1 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded transition cursor-pointer"
+                                title="تعديل مباشر للكمية"
+                              >
+                                <Edit3 className="w-3 h-3" />
+                              </button>
+                            </div>
                           )}
+
+                          {/* Quick Steppers (-1 / +1) */}
+                          <div className="flex items-center gap-1 mt-1">
+                            <button
+                              type="button"
+                              onClick={() => handleQuickDeltaQuantity(p, -1)}
+                              className="w-5 h-5 rounded bg-slate-100 hover:bg-rose-100 text-slate-600 hover:text-rose-700 font-bold text-xs flex items-center justify-center transition cursor-pointer border border-slate-200 active:scale-95"
+                              title="خصم علبة واحدة (-1)"
+                            >
+                              -
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleQuickDeltaQuantity(p, 1)}
+                              className="w-5 h-5 rounded bg-slate-100 hover:bg-emerald-100 text-slate-600 hover:text-emerald-700 font-bold text-xs flex items-center justify-center transition cursor-pointer border border-slate-200 active:scale-95"
+                              title="إضافة علبة واحدة (+1)"
+                            >
+                              +
+                            </button>
+                          </div>
                         </div>
                       </td>
 
                       <td className="p-3 font-bold text-slate-900" dir="ltr">
-                        {p.wholesalePrice.toLocaleString()} {settings.currency}
+                        {(p.wholesalePrice ?? 0).toLocaleString()} {settings.currency}
                       </td>
 
                       <td className="p-3">
@@ -1199,7 +1655,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                               خصم {p.bonusPercentage}%
                             </span>
                             <span className="block font-bold text-xs text-emerald-700" dir="ltr">
-                              {calculateMeltedPrice(p.wholesalePrice, p.bonusPercentage).toLocaleString()} {settings.currency}
+                              {(calculateMeltedPrice(p.wholesalePrice, p.bonusPercentage) ?? 0).toLocaleString()} {settings.currency}
                             </span>
                           </div>
                         ) : (
@@ -1220,6 +1676,23 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                       <td className="p-3 text-center">
                         <div className="flex items-center justify-center gap-1">
                           <button
+                            type="button"
+                            onClick={() => handleOpenSinglePrint(p)}
+                            className="p-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg transition cursor-pointer"
+                            title="طباعة ملصق الباركود على الطابعة المعرفة بالجهاز"
+                          >
+                            <Printer className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setBarcodeEditingProduct(p)}
+                            className="p-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-lg transition cursor-pointer"
+                            title="إدارة وتعديل الباركود"
+                          >
+                            <Barcode className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
                             onClick={() => setAdjustingProduct(p)}
                             className="p-1.5 bg-amber-50 hover:bg-amber-100 text-amber-800 rounded-lg transition cursor-pointer"
                             title="تسوية جردية دقيقة (Audit Adjustment)"
@@ -1227,6 +1700,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                             <Scale className="w-3.5 h-3.5" />
                           </button>
                           <button
+                            type="button"
                             onClick={() => setAuditingProduct(p)}
                             className="p-1.5 bg-purple-50 hover:bg-purple-100 text-purple-700 rounded-lg transition cursor-pointer"
                             title="سجل التدقيق والحركات (Audit Trail)"
@@ -1234,6 +1708,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                             <History className="w-3.5 h-3.5" />
                           </button>
                           <button
+                            type="button"
                             onClick={() => handleOpenEditModal(p)}
                             className="p-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition cursor-pointer"
                             title="تعديل المادة والصلاحية"
@@ -1241,6 +1716,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                             <Edit3 className="w-3.5 h-3.5" />
                           </button>
                           <button
+                            type="button"
                             onClick={() => {
                               if (confirm(`هل أنت متأكد من حذف ${p.tradeNameAr} من المخزن؟`)) {
                                 onDeleteProduct(p.id);
@@ -1258,7 +1734,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                 }))}
                 {filteredProducts.length > displayLimit && (
                   <tr>
-                    <td colSpan={10} className="p-3 text-center bg-slate-50">
+                    <td colSpan={12} className="p-3 text-center bg-slate-50">
                       <button
                         type="button"
                         onClick={() => setDisplayLimit((prev) => prev + 50)}
@@ -1563,11 +2039,11 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                     </label>
                     <div className="px-3 py-2 bg-emerald-50 border border-emerald-200 rounded-lg flex items-center justify-between h-[42px]">
                       <span className="text-sm font-black text-emerald-700">
-                        {calculateMeltedPrice(formData.wholesalePrice, formData.bonusPercentage || 0).toLocaleString()} {settings.currency}
+                        {(calculateMeltedPrice(formData.wholesalePrice, formData.bonusPercentage || 0) ?? 0).toLocaleString()} {settings.currency}
                       </span>
                       {(formData.bonusPercentage || 0) > 0 && (
                         <span className="text-[10px] bg-emerald-600 text-white px-2 py-0.5 rounded-full font-bold">
-                          وفر {Math.round((formData.wholesalePrice * (formData.bonusPercentage || 0)) / 100).toLocaleString()} {settings.currency}
+                          وفر {Math.round(((formData.wholesalePrice || 0) * (formData.bonusPercentage || 0)) / 100).toLocaleString()} {settings.currency}
                         </span>
                       )}
                     </div>
@@ -1816,13 +2292,13 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
                                 {item.stockQuantity}
                               </td>
                               <td className="p-2 font-bold text-slate-900">
-                                {item.wholesalePrice.toLocaleString()} {settings.currency}
+                                {(item.wholesalePrice ?? 0).toLocaleString()} {settings.currency}
                               </td>
                               <td className="p-2 font-semibold text-emerald-700">
                                 {item.bonusPercentage ? `${item.bonusPercentage}%` : '-'}
                               </td>
                               <td className="p-2 text-emerald-800 text-xs font-black">
-                                {calculateMeltedPrice(item.wholesalePrice, item.bonusPercentage).toLocaleString()} {settings.currency}
+                                {(calculateMeltedPrice(item.wholesalePrice, item.bonusPercentage) ?? 0).toLocaleString()} {settings.currency}
                               </td>
                             </tr>
                           ))}
@@ -1871,36 +2347,77 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({
 
       {/* Inventory Batch Adjustment Modal */}
       {adjustingProduct && (
-        <InventoryAdjustmentModal
-          isOpen={true}
-          onClose={() => setAdjustingProduct(null)}
-          product={adjustingProduct}
-          currentUser={currentUser}
-          onProductUpdated={(updated) => {
-            onUpdateProduct(updated);
-            setAdjustingProduct(null);
-          }}
-        />
+        <React.Suspense fallback={null}>
+          <InventoryAdjustmentModal
+            isOpen={true}
+            onClose={() => setAdjustingProduct(null)}
+            product={adjustingProduct}
+            currentUser={currentUser}
+            onProductUpdated={(updated) => {
+              onUpdateProduct(updated);
+              setAdjustingProduct(null);
+            }}
+          />
+        </React.Suspense>
       )}
 
       {/* Product Audit History Modal */}
       {auditingProduct && (
-        <ProductAuditModal
-          isOpen={true}
-          onClose={() => setAuditingProduct(null)}
-          product={auditingProduct}
-        />
+        <React.Suspense fallback={null}>
+          <ProductAuditModal
+            isOpen={true}
+            onClose={() => setAuditingProduct(null)}
+            product={auditingProduct}
+          />
+        </React.Suspense>
       )}
 
       {/* Camera Barcode Scanner Modal */}
       {isScannerOpen && (
-        <CameraBarcodeScannerModal
+        <React.Suspense fallback={null}>
+          <CameraBarcodeScannerModal
+            isOpen={true}
+            onClose={() => setIsScannerOpen(false)}
+            onDetected={(detectedBarcode) => {
+              setSearchTerm(detectedBarcode);
+              setIsScannerOpen(false);
+            }}
+          />
+        </React.Suspense>
+      )}
+
+      {/* Quick Barcode Generation & Editing Modal */}
+      {barcodeEditingProduct && (
+        <QuickBarcodeModal
           isOpen={true}
-          onClose={() => setIsScannerOpen(false)}
-          onDetected={(detectedBarcode) => {
-            setSearchTerm(detectedBarcode);
-            setIsScannerOpen(false);
+          onClose={() => setBarcodeEditingProduct(null)}
+          product={barcodeEditingProduct}
+          allProducts={products}
+          onSaveBarcode={(productId, newBarcode) => handleSaveBarcode(productId, newBarcode)}
+          onOpenPrint={(prod) => {
+            setBarcodeEditingProduct(null);
+            handleOpenSinglePrint(prod);
           }}
+        />
+      )}
+
+      {/* Quick Stock Quantity Adjustment Modal */}
+      {quantityEditingProduct && (
+        <QuickQuantityModal
+          isOpen={true}
+          onClose={() => setQuantityEditingProduct(null)}
+          product={quantityEditingProduct}
+          onSaveQuantity={(productId, newQty) => handleSaveQuantity(productId, newQty)}
+        />
+      )}
+
+      {/* Barcode Print Modal for System-Defined Printers */}
+      {isPrintModalOpen && productsToPrint.length > 0 && (
+        <BarcodePrintModal
+          isOpen={true}
+          onClose={() => setIsPrintModalOpen(false)}
+          productsToPrint={productsToPrint}
+          settings={settings}
         />
       )}
     </div>

@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { AppUser } from '../types';
 import { storage } from '../services/storage';
+import { subscribeToUser } from '../services/firebase';
 import { Clock, ShieldCheck, CheckCircle, RefreshCw, LogOut, Phone, Building2, User, Mail, ShieldAlert } from 'lucide-react';
 
 interface AccountUnderReviewScreenProps {
@@ -53,6 +54,19 @@ export const AccountUnderReviewScreen: React.FC<AccountUnderReviewScreenProps> =
     }
   };
 
+  // Real-time Firestore subscription for instantaneous unlocking when admin approves
+  useEffect(() => {
+    if (!user.id) return;
+    const unsub = subscribeToUser(user.id, (liveUser) => {
+      if (liveUser && (liveUser.status === 'approved' || liveUser.role !== 'pending')) {
+        storage.setCurrentUser(liveUser);
+        storage.updateUser(liveUser);
+        onApproved(liveUser);
+      }
+    });
+    return () => unsub();
+  }, [user.id, onApproved]);
+
   // SSE & periodic polling for instantaneous unlocking the moment admin clicks [Approve]
   useEffect(() => {
     const interval = setInterval(() => {
@@ -63,20 +77,24 @@ export const AccountUnderReviewScreen: React.FC<AccountUnderReviewScreenProps> =
     let eventSource: EventSource | null = null;
     try {
       eventSource = new EventSource('/api/events');
-      eventSource.addEventListener('user_approved', (e: MessageEvent) => {
+      const handleUserEvent = (e: MessageEvent) => {
         try {
-          const approvedUser = JSON.parse(e.data);
+          const u = JSON.parse(e.data);
           if (
-            approvedUser.id === user.id ||
-            approvedUser.identifier === user.identifier ||
-            (user.email && approvedUser.email === user.email)
+            u.id === user.id ||
+            (u.identifier && user.identifier && u.identifier.toLowerCase() === user.identifier.toLowerCase()) ||
+            (user.email && u.email && u.email.toLowerCase() === user.email.toLowerCase())
           ) {
-            storage.setCurrentUser(approvedUser);
-            storage.updateUser(approvedUser);
-            onApproved(approvedUser);
+            if (u.status === 'approved' || (u.role && u.role !== 'pending')) {
+              storage.setCurrentUser(u);
+              storage.updateUser(u);
+              onApproved(u);
+            }
           }
         } catch {}
-      });
+      };
+      eventSource.addEventListener('user_approved', handleUserEvent);
+      eventSource.addEventListener('user_updated', handleUserEvent);
     } catch {}
 
     return () => {
@@ -156,7 +174,7 @@ export const AccountUnderReviewScreen: React.FC<AccountUnderReviewScreenProps> =
               تاريخ تقديم الطلب:
             </span>
             <span dir="ltr" className="font-mono text-slate-400 text-[11px]">
-              {new Date(user.createdAt).toLocaleString('ar-IQ')}
+              {user.createdAt ? new Date(user.createdAt).toLocaleString('ar-IQ') : '—'}
             </span>
           </div>
         </div>

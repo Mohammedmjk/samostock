@@ -21,7 +21,6 @@ import {
   Layers,
   ArrowUpRight
 } from 'lucide-react';
-import * as XLSX from 'xlsx';
 import { Product, Order, WarehouseSettings } from '../types';
 import { calculateExpiryDetails, calculateStockDetails } from '../services/alertService';
 
@@ -204,7 +203,8 @@ export const FinancialReportsPage: React.FC<FinancialReportsPageProps> = ({
   }, [products, activeFilter, searchTerm, now]);
 
   // 5. Detailed Excel Export
-  const handleExportExcel = () => {
+  const handleExportExcel = async () => {
+    const XLSX = await import('xlsx');
     const wb = XLSX.utils.book_new();
 
     // Sheet 1: تقييم المخزون المالي
@@ -256,11 +256,11 @@ export const FinancialReportsPage: React.FC<FinancialReportsPageProps> = ({
 
     // Sheet 4: الملخص المالي العام
     const summaryData = [
-      { 'المؤشر المالي': 'القيمة المخزنية الحقيقية الحالية (الصالح فقط)', 'القيمة': `${financialMetrics.actualActiveInventoryValue.toLocaleString()} د.ع` },
-      { 'المؤشر المالي': 'قيمة المواد منتهية الصلاحية (خسائر محتملة)', 'القيمة': `${financialMetrics.expiredStockValue.toLocaleString()} د.ع` },
-      { 'المؤشر المالي': 'قيمة المواد وشيكة الانتهاء (< 90 يوم)', 'القيمة': `${financialMetrics.nearExpiryValue.toLocaleString()} د.ع` },
-      { 'المؤشر المالي': 'إجمالي مبيعات الطلبات', 'القيمة': `${financialMetrics.totalSalesRevenue.toLocaleString()} د.ع` },
-      { 'المؤشر المالي': 'المبيعات المسلمة فعلياً', 'القيمة': `${financialMetrics.deliveredRevenue.toLocaleString()} د.ع` },
+      { 'المؤشر المالي': 'القيمة المخزنية الحقيقية الحالية (الصالح فقط)', 'القيمة': `${(financialMetrics.actualActiveInventoryValue ?? 0).toLocaleString()} د.ع` },
+      { 'المؤشر المالي': 'قيمة المواد منتهية الصلاحية (خسائر محتملة)', 'القيمة': `${(financialMetrics.expiredStockValue ?? 0).toLocaleString()} د.ع` },
+      { 'المؤشر المالي': 'قيمة المواد وشيكة الانتهاء (< 90 يوم)', 'القيمة': `${(financialMetrics.nearExpiryValue ?? 0).toLocaleString()} د.ع` },
+      { 'المؤشر المالي': 'إجمالي مبيعات الطلبات', 'القيمة': `${(financialMetrics.totalSalesRevenue ?? 0).toLocaleString()} د.ع` },
+      { 'المؤشر المالي': 'المبيعات المسلمة فعلياً', 'القيمة': `${(financialMetrics.deliveredRevenue ?? 0).toLocaleString()} د.ع` },
       { 'المؤشر المالي': 'عدد الأصناف الصالحة والفعالة', 'القيمة': `${financialMetrics.actualActiveItemsCount} صنف` },
       { 'المؤشر المالي': 'عدد الأصناف منتهية الصلاحية', 'القيمة': `${financialMetrics.expiredItemsCount} صنف` },
       { 'المؤشر المالي': 'عدد الأصناف الصفرية الرصيد', 'القيمة': `${financialMetrics.zeroStockItemsCount} صنف` },
@@ -323,7 +323,7 @@ export const FinancialReportsPage: React.FC<FinancialReportsPageProps> = ({
           </div>
           <div className="mt-3">
             <h3 className="text-2xl font-black text-slate-900 tracking-tight">
-              {financialMetrics.actualActiveInventoryValue.toLocaleString()} <span className="text-sm font-bold text-emerald-600">د.ع</span>
+              {(financialMetrics.actualActiveInventoryValue ?? 0).toLocaleString()} <span className="text-sm font-bold text-emerald-600">د.ع</span>
             </h3>
             <p className="text-[11px] text-slate-500 mt-1 font-semibold">
               المخزون الصالح الفعلي ({financialMetrics.actualActiveItemsCount} صنف)
@@ -344,10 +344,10 @@ export const FinancialReportsPage: React.FC<FinancialReportsPageProps> = ({
           </div>
           <div className="mt-3">
             <h3 className="text-2xl font-black text-slate-900 tracking-tight">
-              {financialMetrics.totalSalesRevenue.toLocaleString()} <span className="text-sm font-bold text-blue-600">د.ع</span>
+              {(financialMetrics.totalSalesRevenue ?? 0).toLocaleString()} <span className="text-sm font-bold text-blue-600">د.ع</span>
             </h3>
             <p className="text-[11px] text-slate-500 mt-1 font-semibold">
-              منها {financialMetrics.deliveredRevenue.toLocaleString()} د.ع مسلمة فعلياً
+              منها {(financialMetrics.deliveredRevenue ?? 0).toLocaleString()} د.ع مسلمة فعلياً
             </p>
             <div className="mt-2 text-[10px] text-blue-800 bg-blue-50 py-1 px-2 rounded-lg font-bold">
               {financialMetrics.totalOrdersCount} طلبية واردة من الصيدليات
@@ -365,7 +365,7 @@ export const FinancialReportsPage: React.FC<FinancialReportsPageProps> = ({
           </div>
           <div className="mt-3">
             <h3 className="text-2xl font-black text-rose-600 tracking-tight">
-              {financialMetrics.expiredStockValue.toLocaleString()} <span className="text-sm font-bold text-rose-500">د.ع</span>
+              {(financialMetrics.expiredStockValue ?? 0).toLocaleString()} <span className="text-sm font-bold text-rose-500">د.ع</span>
             </h3>
             <p className="text-[11px] text-slate-500 mt-1 font-semibold">
               مجموع {financialMetrics.expiredItemsCount} صنف منتهي الصلاحية
@@ -386,7 +386,7 @@ export const FinancialReportsPage: React.FC<FinancialReportsPageProps> = ({
           </div>
           <div className="mt-3">
             <h3 className="text-2xl font-black text-amber-600 tracking-tight">
-              {financialMetrics.nearExpiryValue.toLocaleString()} <span className="text-sm font-bold text-amber-500">د.ع</span>
+              {(financialMetrics.nearExpiryValue ?? 0).toLocaleString()} <span className="text-sm font-bold text-amber-500">د.ع</span>
             </h3>
             <p className="text-[11px] text-slate-500 mt-1 font-semibold">
               {financialMetrics.nearExpiryItemsCount} صنف بحاجة لتصريف أو عروض
@@ -577,10 +577,10 @@ export const FinancialReportsPage: React.FC<FinancialReportsPageProps> = ({
                           {p.stockQuantity}
                         </td>
                         <td className="p-3 font-bold text-slate-700">
-                          {p.wholesalePrice.toLocaleString()} د.ع
+                          {(p.wholesalePrice ?? 0).toLocaleString()} د.ع
                         </td>
                         <td className="p-3 font-black text-emerald-700">
-                          {totalItemValue.toLocaleString()} د.ع
+                          {(totalItemValue ?? 0).toLocaleString()} د.ع
                         </td>
                         <td className="p-3 text-center">
                           {expiry.status === 'expired' ? (
@@ -651,7 +651,7 @@ export const FinancialReportsPage: React.FC<FinancialReportsPageProps> = ({
                       </div>
                     </div>
                     <div className="text-left font-black text-xs text-blue-700">
-                      {item.totalRevenue.toLocaleString()} د.ع
+                      {(item.totalRevenue ?? 0).toLocaleString()} د.ع
                     </div>
                   </div>
                 ))}
@@ -696,7 +696,7 @@ export const FinancialReportsPage: React.FC<FinancialReportsPageProps> = ({
                     </div>
                     <div className="text-left">
                       <div className="font-black text-xs text-emerald-700">
-                        {pharmacy.totalSpent.toLocaleString()} د.ع
+                        {(pharmacy.totalSpent ?? 0).toLocaleString()} د.ع
                       </div>
                       <div className="text-[10px] text-slate-400">
                         آخر طلب: {new Date(pharmacy.lastOrder).toLocaleDateString('ar-IQ')}
