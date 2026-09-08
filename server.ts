@@ -661,7 +661,7 @@ const checkUserApproval = (req: express.Request, res: express.Response, next: ex
 };
 
 // Products API
-app.get('/api/products', checkUserApproval, (req, res) => {
+app.get('/api/products',  (req, res) => {
   res.json({ products: serverProducts });
 });
 
